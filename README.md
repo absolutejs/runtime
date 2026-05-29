@@ -62,4 +62,4 @@ The trade-off the default makes explicit: first call after idle pays a full Bun 
 
 ## License
 
-CC BY-NC 4.0 — same as the rest of the AbsoluteJS ecosystem.
+BSL 1.1 with a named carveout for the hosted multi-tenant Bun runtime / PaaS substrate category (Convex, Liveblocks, Vercel, Render, Fly, Cloudflare Workers). See [LICENSE](./LICENSE). Change Date: 4 years from first release; Change License: Apache 2.0.
