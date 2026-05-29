@@ -12,10 +12,9 @@
  * and `@absolutejs/isolated-jsc` — those libraries solve different
  * layers of the same stack.
  *
- * v0.0.1 hibernation strategy (per the design doc, STRATEGY-CLOUD.md
- * §9.5): idle-kill at the process layer. Bun has no shipped
- * process-level snapshot/resume primitive as of 2026-05-29, and no
- * open issue tracking one. When that primitive lands we'll add an
+ * Hibernation strategy (per STRATEGY-CLOUD.md §9.5): idle-kill at the
+ * process layer. Bun has no shipped process-level snapshot/resume
+ * primitive as of 2026-05-29. When that primitive lands we'll add an
  * opt-in `hibernate: 'process-snapshot'` mode and keep idle-kill as
  * the default.
  *
@@ -29,6 +28,7 @@
  *   maxConcurrent: 100,
  *   onMetrics: (event) => prometheus.observe(event),
  *   onLog: (event) => loki.write(event),
+ *   observeIntervalMs: 30_000,
  * });
  *
  * // First call: spawns `bun run start` in /srv/tenants/tenant-42,
@@ -39,7 +39,7 @@
  * // Subsequent calls reuse the running process.
  * runtime.touch('tenant-42'); // bump idle clock
  *
- * runtime.stats(); // { running, total }
+ * runtime.stats(); // { running, total, draining }
  * await runtime.dispose();
  * ```
  */
@@ -47,10 +47,7 @@
 import type { Subprocess } from "bun";
 
 export type TenantSource =
-  | { kind: "directory"; root: string }
-  // Future: { kind: 's3'; bucket: string; prefix: string };
-  // Future: { kind: 'git'; remote: string };
-  ;
+  | { kind: "directory"; root: string };
 
 /** Identity of a single tenant process at a point in time. */
 export type Tenant = {
@@ -66,14 +63,25 @@ export type Tenant = {
   lastTouchedAt: number;
 };
 
-export type RuntimeMetricEvent = {
-  type: "spawn";
-  key: string;
-  pid: number;
-  port: number;
-  durationMs: number;
-};
-// Future: cpu / memory observation events emitted by the sweeper.
+export type RuntimeMetricEvent =
+  | {
+      type: "spawn";
+      key: string;
+      pid: number;
+      port: number;
+      durationMs: number;
+    }
+  | {
+      /** Periodic observation emitted by the sweeper (Linux-only; see `observeIntervalMs`). */
+      type: "observation";
+      key: string;
+      pid: number;
+      /** Cumulative CPU ms used by the child since spawn, derived from `/proc/<pid>/stat`. */
+      cpuMs: number;
+      /** Resident set size in bytes, derived from `/proc/<pid>/status` VmRSS. */
+      rssBytes: number;
+      at: number;
+    };
 
 export type RuntimeLogEvent = {
   key: string;
@@ -84,9 +92,37 @@ export type RuntimeLogEvent = {
   at: number;
 };
 
+/**
+ * Why a tenant process ended. Used by `RuntimeTransitionEvent` of type
+ * `'exit'` to give the consumer enough info to charge or restart correctly:
+ *  - `crashed` — the process exited on its own with a non-zero code
+ *  - `exited-clean` — the process exited 0 (probably a graceful self-stop)
+ *  - `idle-killed` — the sweeper killed it after `idleAfterMs` with no `touch()`
+ *  - `lru-evicted` — `ensure()` for a new tenant evicted this one
+ *  - `killed` — explicit `runtime.kill(key)` call
+ *  - `readiness-timeout` — readiness check failed; we killed during spawn
+ *  - `disposed` — `runtime.dispose()` killed it
+ *  - `restarted` — `runtime.restart(key)` killed it on purpose
+ */
+export type ExitReason =
+  | "crashed"
+  | "exited-clean"
+  | "idle-killed"
+  | "lru-evicted"
+  | "killed"
+  | "readiness-timeout"
+  | "disposed"
+  | "restarted";
+
 export type RuntimeTransitionEvent =
   | { type: "spawn"; key: string; pid: number; port: number }
-  | { type: "ready"; key: string; pid: number; port: number; durationMs: number }
+  | {
+      type: "ready";
+      key: string;
+      pid: number;
+      port: number;
+      durationMs: number;
+    }
   | {
       type: "idle-kill";
       key: string;
@@ -95,7 +131,21 @@ export type RuntimeTransitionEvent =
       idleMs: number;
     }
   | { type: "lru-evict"; key: string; pid: number; reason: "max-concurrent" }
-  | { type: "exit"; key: string; pid: number; exitCode: number | null };
+  | {
+      type: "exit";
+      key: string;
+      pid: number;
+      exitCode: number | null;
+      reason: ExitReason;
+    }
+  | {
+      /** A spawn was deferred because the key is in the back-off window after a failure. */
+      type: "backoff";
+      key: string;
+      attempt: number;
+      retryAfterMs: number;
+    }
+  | { type: "drain"; reason: "drain-requested" };
 
 export type ReadinessCheck = (args: {
   key: string;
@@ -110,6 +160,15 @@ export type SpawnFn = (args: {
   onLogLine: (event: RuntimeLogEvent) => void;
   key: string;
 }) => Promise<Subprocess>;
+
+export type SpawnBackoff = {
+  /** First retry waits this long. Default 1000 ms. */
+  baseMs?: number;
+  /** Maximum back-off (the cap on the doubled wait). Default 60_000 ms. */
+  maxMs?: number;
+  /** After this many consecutive failures, `ensure()` throws immediately for this key until reset. Default 10. */
+  maxFailures?: number;
+};
 
 /** Options for {@link createRuntime}. */
 export type RuntimeOptions = {
@@ -134,8 +193,15 @@ export type RuntimeOptions = {
    */
   sweepIntervalMs?: number;
   /**
+   * How often the sweeper observes CPU + RSS per running tenant. Default
+   * 30_000 ms. Set to `0` to disable; observation only works on Linux
+   * (`/proc/<pid>` derived) — the sweeper silently skips on other OSes.
+   * Output goes to `onMetrics` as `{ type: 'observation', ... }`.
+   */
+  observeIntervalMs?: number;
+  /**
    * Override the readiness check. Default: HTTP GET to
-   * `http://localhost:${port}/` with a 100ms retry loop, give up after
+   * `http://127.0.0.1:${port}/` with a 100ms retry loop, give up after
    * 30s with a `Tenant readiness timed out` error.
    */
   readiness?: ReadinessCheck;
@@ -146,11 +212,13 @@ export type RuntimeOptions = {
    * use this to inject a fixture without writing to disk.
    */
   spawn?: SpawnFn;
-  /** Operational metrics — spawn/ready durations etc. */
+  /** Exponential-backoff policy for consecutive spawn failures. */
+  backoff?: SpawnBackoff;
+  /** Operational metrics — spawn/ready durations + periodic observations. */
   onMetrics?: (event: RuntimeMetricEvent) => void;
   /** stdout/stderr stream. Bounded internally; backpressure to the host. */
   onLog?: (event: RuntimeLogEvent) => void;
-  /** Lifecycle events — spawn/ready/idle-kill/lru-evict/exit. */
+  /** Lifecycle events — spawn/ready/idle-kill/lru-evict/exit/backoff/drain. */
   onTransition?: (event: RuntimeTransitionEvent) => void;
   /**
    * Command to run when spawning. Default `['bun', 'run', 'start']`.
@@ -162,6 +230,10 @@ export type RuntimeOptions = {
 export type RuntimeStats = {
   running: number;
   total: number;
+  /** True when the runtime is draining — refusing new ensure() calls. */
+  draining: boolean;
+  /** Number of keys currently in the back-off window. */
+  backoff: number;
 };
 
 export type Runtime = {
@@ -170,6 +242,9 @@ export type Runtime = {
    * for readiness, returns the live {@link Tenant} including the bound
    * `port`. Concurrent calls to the same key share a single-flight
    * spawn — N callers don't create N processes.
+   *
+   * If `key` is in the back-off window after a recent failure, throws
+   * immediately (without spawning). Use `clearBackoff(key)` to retry early.
    */
   ensure: (key: string) => Promise<Tenant>;
   /**
@@ -183,6 +258,21 @@ export type Runtime = {
   stats: () => RuntimeStats;
   /** Force-kill `key`. No-op if not running. */
   kill: (key: string) => Promise<void>;
+  /**
+   * Kill `key` and respawn it. Used by deploys to swap to a new release
+   * after the `current` symlink has been updated. Concurrent restart
+   * calls for the same key share a single-flight respawn.
+   */
+  restart: (key: string) => Promise<Tenant>;
+  /** Forget any consecutive-failure state for `key`. Next `ensure()` retries immediately. */
+  clearBackoff: (key: string) => void;
+  /**
+   * Begin draining: refuse new `ensure()` calls (they throw immediately).
+   * In-flight spawns and existing tenants are untouched — wait for
+   * `stats().running` to reach 0, or call `dispose()` for hard shutdown.
+   * Useful for graceful shard shutdown before a host reboot.
+   */
+  drain: () => void;
   /** Dispose every running child + stop the sweep. Idempotent. */
   dispose: () => Promise<void>;
 };
@@ -195,6 +285,14 @@ type Entry = {
   pending: Promise<Tenant> | null;
   tenant: Tenant | null;
   child: Subprocess | null;
+  /** Set by code that's about to kill the child, read by the exit handler. */
+  pendingExitReason: ExitReason | null;
+};
+
+type BackoffState = {
+  attempt: number;
+  retryAt: number;
+  lastError: string;
 };
 
 const defaultReadiness: ReadinessCheck = async ({ port, startedAt }) => {
@@ -204,7 +302,6 @@ const defaultReadiness: ReadinessCheck = async ({ port, startedAt }) => {
       const res = await fetch(`http://127.0.0.1:${port}/`, {
         signal: AbortSignal.timeout(2_000),
       });
-      // Any response — even 404 — means the server bound the port.
       void res;
       return true;
     } catch {
@@ -214,13 +311,6 @@ const defaultReadiness: ReadinessCheck = async ({ port, startedAt }) => {
   throw new Error("Tenant readiness timed out after 30s");
 };
 
-/**
- * Ask the OS for a currently-free TCP port by binding 0 + closing.
- * Race window: another process can grab the port between close and
- * the child's bind. Acceptable for v0.0.1; production deployments
- * should use a coordinated port allocator (or have the child bind 0
- * and report back via stdout, which is a v0.0.2 follow-up).
- */
 const allocateEphemeralPort = (): number => {
   const server = Bun.listen({
     hostname: "127.0.0.1",
@@ -236,7 +326,6 @@ const allocateEphemeralPort = (): number => {
 };
 
 const splitLines = (() => {
-  // Per-stream remainder, keyed by child pid + stream label.
   const remainders = new Map<string, string>();
   return (key: string, chunk: string): string[] => {
     const prior = remainders.get(key) ?? "";
@@ -247,21 +336,54 @@ const splitLines = (() => {
   };
 })();
 
-const defaultSpawn: SpawnFn = async ({
+const isLinux = typeof process !== "undefined" && process.platform === "linux";
+
+/**
+ * Read CPU + RSS for a pid from `/proc`. Returns `null` if the pid is gone
+ * or we're not on Linux. The math: `utime + stime` from `/proc/<pid>/stat`
+ * is in clock ticks; we divide by `Bun.clockTicksPerSecond` (or fall back
+ * to 100 — the universal default for Linux kernels).
+ */
+const readProcStats = async (pid: number): Promise<{ cpuMs: number; rssBytes: number } | null> => {
+  if (!isLinux) return null;
+  try {
+    const statText = await Bun.file(`/proc/${pid}/stat`).text();
+    const statusText = await Bun.file(`/proc/${pid}/status`).text();
+    // /proc/<pid>/stat: ... (comm) ... and utime/stime are fields 14 and 15
+    // counting from 1; but `comm` can contain spaces, so we anchor on the
+    // closing paren.
+    const closeParen = statText.lastIndexOf(")");
+    if (closeParen === -1) return null;
+    const after = statText.slice(closeParen + 2).split(" ");
+    // After (comm), the fields are: state ppid pgrp session ... utime stime ...
+    // utime = field 14 of the whole line = index (14 - 3 - 1) = 10 of `after`.
+    const utime = Number(after[11]);
+    const stime = Number(after[12]);
+    if (!Number.isFinite(utime) || !Number.isFinite(stime)) return null;
+    const ticksPerSec = (globalThis as { Bun?: { clockTicksPerSecond?: number } }).Bun?.clockTicksPerSecond ?? 100;
+    const cpuMs = ((utime + stime) / ticksPerSec) * 1000;
+    const match = statusText.match(/^VmRSS:\s+(\d+)\s+kB/m);
+    const rssBytes = match && match[1] ? Number(match[1]) * 1024 : 0;
+    return { cpuMs, rssBytes };
+  } catch {
+    return null;
+  }
+};
+
+const defaultSpawn = (command: readonly string[]): SpawnFn => async ({
   cwd,
   env,
   onLogLine,
   key,
 }) => {
   const child = Bun.spawn({
-    cmd: ["bun", "run", "start"],
+    cmd: [...command],
     cwd,
     env,
     stderr: "pipe",
     stdout: "pipe",
   });
 
-  // Stream stdout/stderr into onLogLine as newline-terminated lines.
   const readStream = (
     stream: ReadableStream<Uint8Array> | undefined | null,
     label: "stdout" | "stderr",
@@ -287,7 +409,7 @@ const defaultSpawn: SpawnFn = async ({
           }
         }
       } catch {
-        // stream errored on child exit; nothing to surface
+        /* stream errored on child exit; nothing to surface */
       }
     })();
   };
@@ -302,15 +424,27 @@ export const createRuntime = (options: RuntimeOptions): Runtime => {
   const idleAfterMs = options.idleAfterMs ?? 5 * 60 * 1000;
   const maxConcurrent = options.maxConcurrent ?? 100;
   const sweepIntervalMs = options.sweepIntervalMs ?? 10_000;
+  const observeIntervalMs = options.observeIntervalMs ?? 30_000;
   const readiness = options.readiness ?? defaultReadiness;
-  const spawn = options.spawn ?? defaultSpawn;
+  const command = options.command ?? ["bun", "run", "start"];
+  const spawn = options.spawn ?? defaultSpawn(command);
   const onMetrics = options.onMetrics;
   const onLog = options.onLog;
   const onTransition = options.onTransition;
+  const backoffOptions: Required<SpawnBackoff> = {
+    baseMs: options.backoff?.baseMs ?? 1_000,
+    maxFailures: options.backoff?.maxFailures ?? 10,
+    maxMs: options.backoff?.maxMs ?? 60_000,
+  };
 
   const entries = new Map<string, Entry>();
+  const backoffs = new Map<string, BackoffState>();
+  /** Pending exit reasons keyed by child pid — read by the .then exit handler. */
+  const exitReasons = new Map<number, ExitReason>();
   let sweepTimer: ReturnType<typeof setInterval> | undefined;
+  let lastObserveAt = 0;
   let disposed = false;
+  let draining = false;
 
   const emitMetric = (event: RuntimeMetricEvent): void => {
     if (onMetrics === undefined) return;
@@ -346,9 +480,11 @@ export const createRuntime = (options: RuntimeOptions): Runtime => {
     );
   };
 
-  const killChild = async (entry: Entry): Promise<void> => {
+  const killChildWithReason = async (entry: Entry, reason: ExitReason): Promise<void> => {
     const child = entry.child;
     if (child === null) return;
+    entry.pendingExitReason = reason;
+    exitReasons.set(child.pid, reason);
     try {
       child.kill();
     } catch {
@@ -361,9 +497,37 @@ export const createRuntime = (options: RuntimeOptions): Runtime => {
     }
   };
 
-  const removeEntry = async (key: string, entry: Entry): Promise<void> => {
+  const removeEntry = async (key: string, entry: Entry, reason: ExitReason): Promise<void> => {
     entries.delete(key);
-    await killChild(entry);
+    await killChildWithReason(entry, reason);
+  };
+
+  const recordBackoff = (key: string, error: unknown): void => {
+    const prev = backoffs.get(key);
+    const attempt = (prev?.attempt ?? 0) + 1;
+    const wait = Math.min(backoffOptions.maxMs, backoffOptions.baseMs * 2 ** (attempt - 1));
+    const message = error instanceof Error ? error.message : String(error);
+    backoffs.set(key, { attempt, lastError: message, retryAt: Date.now() + wait });
+  };
+
+  const observeRunning = async (): Promise<void> => {
+    if (!isLinux || observeIntervalMs <= 0 || onMetrics === undefined) return;
+    const now = Date.now();
+    if (now - lastObserveAt < observeIntervalMs) return;
+    lastObserveAt = now;
+    for (const [key, entry] of entries) {
+      if (entry.tenant === null) continue;
+      const stats = await readProcStats(entry.tenant.pid);
+      if (stats === null) continue;
+      emitMetric({
+        at: now,
+        cpuMs: stats.cpuMs,
+        key,
+        pid: entry.tenant.pid,
+        rssBytes: stats.rssBytes,
+        type: "observation",
+      });
+    }
   };
 
   const startSweepIfNeeded = (): void => {
@@ -383,9 +547,10 @@ export const createRuntime = (options: RuntimeOptions): Runtime => {
             reason: "idle-threshold",
             type: "idle-kill",
           });
-          void removeEntry(key, entry).catch(() => {});
+          void removeEntry(key, entry, "idle-killed").catch(() => {});
         }
       }
+      void observeRunning().catch(() => {});
       if (entries.size === 0 && sweepTimer !== undefined) {
         clearInterval(sweepTimer);
         sweepTimer = undefined;
@@ -401,7 +566,7 @@ export const createRuntime = (options: RuntimeOptions): Runtime => {
     let oldestKey: string | undefined;
     let oldestEntry: Entry | undefined;
     for (const [key, entry] of entries) {
-      if (entry.tenant === null) continue; // mid-spawn; don't evict
+      if (entry.tenant === null) continue;
       if (
         oldestEntry === undefined ||
         oldestEntry.tenant === null ||
@@ -418,12 +583,13 @@ export const createRuntime = (options: RuntimeOptions): Runtime => {
         reason: "max-concurrent",
         type: "lru-evict",
       });
-      void removeEntry(oldestKey, oldestEntry).catch(() => {});
+      void removeEntry(oldestKey, oldestEntry, "lru-evicted").catch(() => {});
     }
   };
 
   const spawnFresh = async (key: string): Promise<Tenant> => {
     if (disposed) throw new Error("runtime has been disposed");
+    if (draining) throw new Error("runtime is draining; ensure() refused");
     evictLruIfNeeded();
 
     const port = allocateEphemeralPort();
@@ -435,28 +601,38 @@ export const createRuntime = (options: RuntimeOptions): Runtime => {
       PORT: String(port),
     };
 
-    const child = await spawn({
-      cwd,
-      env,
-      key,
-      onLogLine: emitLog,
-    });
+    let child: Subprocess;
+    try {
+      child = await spawn({
+        cwd,
+        env,
+        key,
+        onLogLine: emitLog,
+      });
+    } catch (error) {
+      entries.delete(key);
+      recordBackoff(key, error);
+      throw error;
+    }
 
     emitTransition({ key, pid: child.pid, port, type: "spawn" });
 
-    // Reap the entry when the process exits — whether we killed it or
-    // it died on its own. Single source of truth for "is this tenant
-    // running": the entry's `tenant` field.
+    // Reap the entry when the process exits. We capture the entry's
+    // `pendingExitReason` if some code path set one; otherwise classify
+    // by exit code.
     void child.exited
       .then((exitCode) => {
+        const stashed = exitReasons.get(child.pid);
+        const reason: ExitReason =
+          stashed ?? (exitCode === 0 ? "exited-clean" : "crashed");
+        exitReasons.delete(child.pid);
         emitTransition({
           exitCode: exitCode ?? null,
           key,
           pid: child.pid,
+          reason,
           type: "exit",
         });
-        // Only delete if THIS entry is still the live one. A consumer
-        // who killed + immediately re-ensured may have replaced it.
         const current = entries.get(key);
         if (current !== undefined && current.child === child) {
           entries.delete(key);
@@ -467,12 +643,17 @@ export const createRuntime = (options: RuntimeOptions): Runtime => {
     try {
       await readiness({ key, port, startedAt });
     } catch (error) {
+      const entry = entries.get(key);
+      if (entry !== undefined) {
+        entry.pendingExitReason = "readiness-timeout";
+      }
       try {
         child.kill();
       } catch {
         /* ignore */
       }
       entries.delete(key);
+      recordBackoff(key, error);
       throw error;
     }
 
@@ -489,6 +670,7 @@ export const createRuntime = (options: RuntimeOptions): Runtime => {
       entry.child = child;
       entry.pending = null;
     }
+    backoffs.delete(key);
     const durationMs = Date.now() - startedAt;
     emitMetric({
       durationMs,
@@ -508,6 +690,28 @@ export const createRuntime = (options: RuntimeOptions): Runtime => {
     return tenant;
   };
 
+  const checkBackoff = (key: string): void => {
+    const state = backoffs.get(key);
+    if (state === undefined) return;
+    if (state.attempt >= backoffOptions.maxFailures) {
+      throw new Error(
+        `Tenant "${key}" exceeded ${backoffOptions.maxFailures} consecutive spawn failures; clearBackoff() to retry. Last error: ${state.lastError}`,
+      );
+    }
+    const remaining = state.retryAt - Date.now();
+    if (remaining > 0) {
+      emitTransition({
+        attempt: state.attempt,
+        key,
+        retryAfterMs: remaining,
+        type: "backoff",
+      });
+      throw new Error(
+        `Tenant "${key}" is backing off after ${state.attempt} failure(s); retry in ${remaining}ms. Last error: ${state.lastError}`,
+      );
+    }
+  };
+
   return {
     async ensure(key) {
       if (disposed) throw new Error("runtime has been disposed");
@@ -521,10 +725,14 @@ export const createRuntime = (options: RuntimeOptions): Runtime => {
           return existing.pending;
         }
       }
+      // From here we'd spawn a fresh process — drain only refuses NEW spawns.
+      if (draining) throw new Error("runtime is draining; ensure() refused");
+      checkBackoff(key);
       const fresh: Entry = {
         child: null,
         key,
         pending: null,
+        pendingExitReason: null,
         tenant: null,
       };
       const promise = spawnFresh(key);
@@ -544,13 +752,43 @@ export const createRuntime = (options: RuntimeOptions): Runtime => {
       for (const entry of entries.values()) {
         if (entry.tenant !== null) running += 1;
       }
-      return { running, total: entries.size };
+      return { backoff: backoffs.size, draining, running, total: entries.size };
     },
 
     async kill(key) {
       const entry = entries.get(key);
       if (entry === undefined) return;
-      await removeEntry(key, entry);
+      await removeEntry(key, entry, "killed");
+    },
+
+    async restart(key) {
+      if (disposed) throw new Error("runtime has been disposed");
+      const entry = entries.get(key);
+      if (entry !== undefined) {
+        await removeEntry(key, entry, "restarted");
+      }
+      // Same single-flight contract as ensure().
+      const fresh: Entry = {
+        child: null,
+        key,
+        pending: null,
+        pendingExitReason: null,
+        tenant: null,
+      };
+      const promise = spawnFresh(key);
+      fresh.pending = promise;
+      entries.set(key, fresh);
+      return promise;
+    },
+
+    clearBackoff(key) {
+      backoffs.delete(key);
+    },
+
+    drain() {
+      if (draining) return;
+      draining = true;
+      emitTransition({ reason: "drain-requested", type: "drain" });
     },
 
     async dispose() {
@@ -560,9 +798,9 @@ export const createRuntime = (options: RuntimeOptions): Runtime => {
         clearInterval(sweepTimer);
         sweepTimer = undefined;
       }
-      const snapshot = [...entries.values()];
+      const snapshot = [...entries.entries()];
       entries.clear();
-      await Promise.all(snapshot.map((entry) => killChild(entry)));
+      await Promise.all(snapshot.map(([_key, entry]) => killChildWithReason(entry, "disposed")));
     },
   };
 };

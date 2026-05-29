@@ -27,18 +27,29 @@ runtime.stats(); // { running, total }
 await runtime.dispose();
 ```
 
-## v0.0.1 surface
+## Surface (0.1.0)
 
 | API | Purpose |
 |---|---|
 | `createRuntime(options)` | Factory. Returns a `Runtime`. |
-| `runtime.ensure(key)` | Spawn-or-reuse. Single-flight on concurrent calls to the same key. Returns `{ key, port, pid, startedAt, lastTouchedAt }`. |
+| `runtime.ensure(key)` | Spawn-or-reuse. Single-flight on concurrent calls to the same key. Throws fast if `key` is in a back-off window. Returns `{ key, port, pid, startedAt, lastTouchedAt }`. |
 | `runtime.touch(key)` | Bump the idle clock for an active tenant. Cheap; call before/after each request. |
-| `runtime.stats()` | `{ running, total }` snapshot. |
+| `runtime.stats()` | `{ running, total, draining, backoff }` snapshot. |
 | `runtime.kill(key)` | Force-kill. No-op if not running. |
+| `runtime.restart(key)` | Kill + spawn fresh in one call. For deploys that swap to a new release. |
+| `runtime.clearBackoff(key)` | Forget consecutive-failure state. |
+| `runtime.drain()` | Refuse new `ensure()` spawns; existing tenants keep running. For graceful shard shutdown. |
 | `runtime.dispose()` | Kill all + stop the sweeper. Idempotent. |
 
-### Hibernation strategy (v0.0.1)
+### Back-off on spawn failures
+
+A spawn that fails (spawn fn threw, or readiness timed out) records a per-key `{ attempt, retryAt, lastError }` and the next `ensure(key)` throws fast until `retryAt`. After `maxFailures` (default 10) consecutive failures, the key stays refused until `clearBackoff(key)`. Defaults: `baseMs=1000`, `maxMs=60_000`, `maxFailures=10`. Override via the `backoff` option. Without this, one broken tenant thrashes the host with rapid spawn retries.
+
+### Observation (Linux-only)
+
+When `observeIntervalMs > 0` (default `30_000`), the sweeper periodically reads `/proc/<pid>/stat` (utime + stime) and `/proc/<pid>/status` (VmRSS) per running tenant and emits `{ type: 'observation', key, pid, cpuMs, rssBytes, at }` via `onMetrics`. This is the per-tenant data `@absolutejs/metering` consumes to attribute idle hibernation cost. Silently skips on non-Linux.
+
+### Hibernation strategy
 
 **Idle-kill at the process layer**, plus the JSC-context hibernation any tenant gets for free via `@absolutejs/isolated-jsc`'s `createHibernatingIsolatePool`. Bun has no process-level snapshot/resume primitive shipped or tracked in an open issue as of 2026-05-29; when one lands we'll add an opt-in `hibernate: 'process-snapshot'` mode and keep idle-kill as the default.
 
@@ -46,7 +57,11 @@ The trade-off the default makes explicit: first call after idle pays a full Bun 
 
 ### Observability hooks
 
-`onLog`, `onMetrics`, and `onTransition` are pluggable. `onLog` receives newline-split stdout/stderr from every child; `onMetrics` fires on spawn with `durationMs`; `onTransition` fires on every state change (`spawn` / `ready` / `idle-kill` / `lru-evict` / `exit`).
+`onLog`, `onMetrics`, and `onTransition` are pluggable. `onLog` receives newline-split stdout/stderr from every child; `onMetrics` fires on spawn (`{ type: 'spawn', durationMs }`) and periodically with observations on Linux (`{ type: 'observation', cpuMs, rssBytes }`); `onTransition` fires on every state change: `spawn`, `ready`, `idle-kill`, `lru-evict`, `exit` (with a structured `reason`), `backoff`, `drain`.
+
+### Exit reasons
+
+The `exit` transition's `reason` field is one of: `crashed`, `exited-clean`, `idle-killed`, `lru-evicted`, `killed`, `readiness-timeout`, `disposed`, `restarted`. The meter / control plane uses this to decide whether to charge, retry, or alert.
 
 ### Pluggable spawn + readiness
 

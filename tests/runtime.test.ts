@@ -71,7 +71,7 @@ describe("createRuntime", () => {
     expect(res.status).toBe(200);
     expect(await res.text()).toBe("ok");
 
-    expect(runtime.stats()).toEqual({ running: 1, total: 1 });
+    expect(runtime.stats()).toMatchObject({ running: 1, total: 1 });
   });
 
   test("ensure called twice for the same key reuses the same process", async () => {
@@ -188,7 +188,7 @@ describe("createRuntime", () => {
     await runtime.ensure("beta");
     expect(runtime.stats().running).toBe(2);
     await runtime.dispose();
-    expect(runtime.stats()).toEqual({ running: 0, total: 0 });
+    expect(runtime.stats()).toMatchObject({ running: 0, total: 0 });
     runtime = null; // afterEach no-op
   });
 
@@ -268,5 +268,143 @@ describe("createRuntime", () => {
     expect(calls.length).toBe(1);
     expect(calls[0]?.key).toBe("alpha");
     expect(calls[0]?.port).toBeGreaterThan(0);
+  });
+
+  // ───────── 0.1.0 surface ──────────────────────────────────────────────
+
+  test("exit transition carries a structured `reason` (killed)", async () => {
+    const transitions: RuntimeTransitionEvent[] = [];
+    runtime = createRuntime({
+      onTransition: (event) => transitions.push(event),
+      source: { kind: "directory", root: fixturesRoot },
+    });
+    await runtime.ensure("alpha");
+    await runtime.kill("alpha");
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    const exit = transitions.find((event) => event.type === "exit");
+    expect(exit).toBeDefined();
+    if (exit && exit.type === "exit") {
+      expect(exit.reason).toBe("killed");
+    }
+  });
+
+  test("exit transition reason is `idle-killed` when the sweeper kills", async () => {
+    const transitions: RuntimeTransitionEvent[] = [];
+    runtime = createRuntime({
+      idleAfterMs: 50,
+      onTransition: (event) => transitions.push(event),
+      source: { kind: "directory", root: fixturesRoot },
+      sweepIntervalMs: 25,
+    });
+    await runtime.ensure("alpha");
+    await new Promise((resolve) => setTimeout(resolve, 200));
+    const exit = transitions.find((event) => event.type === "exit");
+    expect(exit).toBeDefined();
+    if (exit && exit.type === "exit") {
+      expect(exit.reason).toBe("idle-killed");
+    }
+  });
+
+  test("restart kills the old child and spawns a fresh one", async () => {
+    runtime = createRuntime({ source: { kind: "directory", root: fixturesRoot } });
+    const first = await runtime.ensure("alpha");
+    const before = first.pid;
+    const after = await runtime.restart("alpha");
+    expect(after.pid).not.toBe(before);
+    expect(runtime.stats().running).toBe(1);
+    const res = await fetch(`http://127.0.0.1:${after.port}/health`);
+    expect(res.status).toBe(200);
+  });
+
+  test("spawn failure records back-off; ensure throws fast on next call", async () => {
+    let invocations = 0;
+    runtime = createRuntime({
+      backoff: { baseMs: 200, maxFailures: 5, maxMs: 2_000 },
+      source: { kind: "directory", root: fixturesRoot },
+      spawn: async () => {
+        invocations += 1;
+        throw new Error("synthetic spawn failure");
+      },
+    });
+    await expect(runtime.ensure("alpha")).rejects.toThrow(/synthetic/);
+    expect(invocations).toBe(1);
+    // Immediate retry should be refused without invoking spawn again.
+    await expect(runtime.ensure("alpha")).rejects.toThrow(/backing off/i);
+    expect(invocations).toBe(1);
+    expect(runtime.stats().backoff).toBe(1);
+  });
+
+  test("clearBackoff lets a failing key retry immediately", async () => {
+    let invocations = 0;
+    runtime = createRuntime({
+      backoff: { baseMs: 5_000, maxFailures: 5, maxMs: 60_000 },
+      source: { kind: "directory", root: fixturesRoot },
+      spawn: async () => {
+        invocations += 1;
+        throw new Error("nope");
+      },
+    });
+    await expect(runtime.ensure("alpha")).rejects.toThrow();
+    runtime.clearBackoff("alpha");
+    await expect(runtime.ensure("alpha")).rejects.toThrow();
+    expect(invocations).toBe(2);
+  });
+
+  test("ensure throws once maxFailures consecutive errors are recorded", async () => {
+    runtime = createRuntime({
+      backoff: { baseMs: 1, maxFailures: 3, maxMs: 5 },
+      source: { kind: "directory", root: fixturesRoot },
+      spawn: async () => {
+        throw new Error("always fails");
+      },
+    });
+    await expect(runtime.ensure("alpha")).rejects.toThrow();
+    await new Promise((resolve) => setTimeout(resolve, 10));
+    await expect(runtime.ensure("alpha")).rejects.toThrow();
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    await expect(runtime.ensure("alpha")).rejects.toThrow();
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    // 4th attempt: now over maxFailures, should refuse without invoking spawn.
+    await expect(runtime.ensure("alpha")).rejects.toThrow(/exceeded.*consecutive/i);
+  });
+
+  test("drain refuses new ensure calls; existing tenants keep running", async () => {
+    const transitions: RuntimeTransitionEvent[] = [];
+    runtime = createRuntime({
+      onTransition: (event) => transitions.push(event),
+      source: { kind: "directory", root: fixturesRoot },
+    });
+    await runtime.ensure("alpha");
+    expect(runtime.stats().running).toBe(1);
+    runtime.drain();
+    expect(runtime.stats().draining).toBe(true);
+    await expect(runtime.ensure("beta")).rejects.toThrow(/draining/);
+    // alpha is still serving.
+    const tenant = await runtime.ensure("alpha");
+    expect(tenant.pid).toBeGreaterThan(0);
+    const drainEvent = transitions.find((event) => event.type === "drain");
+    expect(drainEvent).toBeDefined();
+  });
+
+  test("observation metrics fire periodically on Linux", async () => {
+    if (process.platform !== "linux") return;
+    const metrics: { type: string; key?: string; cpuMs?: number; rssBytes?: number }[] = [];
+    runtime = createRuntime({
+      observeIntervalMs: 50,
+      onMetrics: (event) => metrics.push(event as { type: string; key?: string; cpuMs?: number; rssBytes?: number }),
+      source: { kind: "directory", root: fixturesRoot },
+      sweepIntervalMs: 30,
+    });
+    await runtime.ensure("alpha");
+    await new Promise((resolve) => setTimeout(resolve, 200));
+    const observations = metrics.filter((event) => event.type === "observation");
+    expect(observations.length).toBeGreaterThan(0);
+    const sample = observations[0];
+    if (sample) {
+      expect(sample.key).toBe("alpha");
+      expect(sample.rssBytes).toBeGreaterThan(0);
+      // cpuMs may be 0 for a freshly-spawned idle child; just ensure it's a number.
+      expect(typeof sample.cpuMs).toBe("number");
+    }
   });
 });
