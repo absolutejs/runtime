@@ -2,6 +2,33 @@
 
 All notable changes to `@absolutejs/runtime` are documented here.
 
+## 0.2.0 — 2026-05-29
+
+Substrate-pattern uniformity. Backwards-compatible — `stats()` keeps
+its 0.1.0 shape; `metrics()` is the new operator-shaped surface.
+
+### Added
+
+- **`Runtime.metrics()`** returning `RuntimeMetrics` — the point-in-time
+  `RuntimeStats` fields plus cumulative counters:
+  - `totalSpawns` — successful `spawn()` calls since `createRuntime()`.
+  - `totalExits` — `Record<ExitReason, number>` since start. A climbing
+    `crashed` means a tenant is unhealthy; `idle-killed` is the steady
+    state for hibernation; `lru-evicted` means the `maxRunning` cap is
+    biting.
+  - `totalBackoffEntries` — cumulative `recordBackoff` calls. Distinct
+    from the point-in-time `backoff` (current keys in window): a key
+    that fails 5× bumps `totalBackoffEntries` by 5 but contributes 1
+    to `backoff`.
+  - `lastSpawnMs` — wall-clock of the most recent spawn. A climb means
+    spawning is slowing down (cold disk, contention, network mounts).
+- Survives `dispose()` so post-shutdown introspection still reads totals.
+
+`stats()` kept unchanged for back-compat — it returns a subset of
+`metrics()`. New code should use `metrics()`.
+
+8 new tests in `tests/metrics.test.ts`. Test count: 21 → 29.
+
 ## 0.1.0 - 2026-05-29
 
 Substrate-deepening pass for the PaaS. Backwards-compatible with 0.0.1 —

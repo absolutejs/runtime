@@ -236,6 +236,32 @@ export type RuntimeStats = {
   backoff: number;
 };
 
+/**
+ * Operator-shaped metrics returned by {@link Runtime.metrics}. Combines
+ * the point-in-time {@link RuntimeStats} fields with cumulative counters
+ * since `createRuntime()`. Survives `dispose()` so post-shutdown
+ * introspection still reads the totals. Added in 0.2.0.
+ *
+ * - `totalSpawns` — successful `spawn()` calls (failed spawns hit
+ *   `recordBackoff` instead and bump `totalBackoffEntries`).
+ * - `totalExits` — exits keyed by `ExitReason`. A climbing
+ *   `crashed` means a tenant is unhealthy; `idle-killed` is the
+ *   expected steady-state for hibernation; `lru-evicted` means the
+ *   `maxRunning` cap is biting.
+ * - `totalBackoffEntries` — `recordBackoff` calls. Distinct from the
+ *   point-in-time `backoff` (current keys in window): a single key
+ *   that fails 5 times bumps `totalBackoffEntries` by 5 but only
+ *   contributes 1 to `backoff`.
+ * - `lastSpawnMs` — wall-clock of the most recent spawn. A climb
+ *   here is the operator's "is spawning getting slow" signal.
+ */
+export type RuntimeMetrics = RuntimeStats & {
+  totalSpawns: number;
+  totalExits: Record<ExitReason, number>;
+  totalBackoffEntries: number;
+  lastSpawnMs: number;
+};
+
 export type Runtime = {
   /**
    * Resolve `key` to a running tenant. Spawns if not running, waits
@@ -254,8 +280,14 @@ export type Runtime = {
    * tenant.
    */
   touch: (key: string) => void;
-  /** Synchronous snapshot. */
+  /** Synchronous point-in-time snapshot — back-compat alias of metrics() shape (subset). */
   stats: () => RuntimeStats;
+  /**
+   * Operator-shaped point-in-time + cumulative metrics (since
+   * `createRuntime()`). Use this — `stats()` is kept for back-compat
+   * but doesn't carry the cumulative counters. Added in 0.2.0.
+   */
+  metrics: () => RuntimeMetrics;
   /** Force-kill `key`. No-op if not running. */
   kill: (key: string) => Promise<void>;
   /**
@@ -445,6 +477,21 @@ export const createRuntime = (options: RuntimeOptions): Runtime => {
   let lastObserveAt = 0;
   let disposed = false;
   let draining = false;
+  // 0.2.0: cumulative operator counters surfaced via metrics(). Survive
+  // dispose() so post-shutdown introspection still reads totals.
+  let totalSpawns = 0;
+  const totalExits: Record<ExitReason, number> = {
+    'crashed': 0,
+    'exited-clean': 0,
+    'idle-killed': 0,
+    'lru-evicted': 0,
+    'killed': 0,
+    'readiness-timeout': 0,
+    'disposed': 0,
+    'restarted': 0
+  };
+  let totalBackoffEntries = 0;
+  let lastSpawnMs = 0;
 
   const emitMetric = (event: RuntimeMetricEvent): void => {
     if (onMetrics === undefined) return;
@@ -508,6 +555,7 @@ export const createRuntime = (options: RuntimeOptions): Runtime => {
     const wait = Math.min(backoffOptions.maxMs, backoffOptions.baseMs * 2 ** (attempt - 1));
     const message = error instanceof Error ? error.message : String(error);
     backoffs.set(key, { attempt, lastError: message, retryAt: Date.now() + wait });
+    totalBackoffEntries += 1;
   };
 
   const observeRunning = async (): Promise<void> => {
@@ -602,6 +650,7 @@ export const createRuntime = (options: RuntimeOptions): Runtime => {
     };
 
     let child: Subprocess;
+    const spawnStart = Date.now();
     try {
       child = await spawn({
         cwd,
@@ -615,6 +664,8 @@ export const createRuntime = (options: RuntimeOptions): Runtime => {
       throw error;
     }
 
+    totalSpawns += 1;
+    lastSpawnMs = Date.now() - spawnStart;
     emitTransition({ key, pid: child.pid, port, type: "spawn" });
 
     // Reap the entry when the process exits. We capture the entry's
@@ -626,6 +677,7 @@ export const createRuntime = (options: RuntimeOptions): Runtime => {
         const reason: ExitReason =
           stashed ?? (exitCode === 0 ? "exited-clean" : "crashed");
         exitReasons.delete(child.pid);
+        totalExits[reason] += 1;
         emitTransition({
           exitCode: exitCode ?? null,
           key,
@@ -753,6 +805,23 @@ export const createRuntime = (options: RuntimeOptions): Runtime => {
         if (entry.tenant !== null) running += 1;
       }
       return { backoff: backoffs.size, draining, running, total: entries.size };
+    },
+
+    metrics() {
+      let running = 0;
+      for (const entry of entries.values()) {
+        if (entry.tenant !== null) running += 1;
+      }
+      return {
+        backoff: backoffs.size,
+        draining,
+        lastSpawnMs,
+        running,
+        total: entries.size,
+        totalBackoffEntries,
+        totalExits: { ...totalExits },
+        totalSpawns
+      };
     },
 
     async kill(key) {
