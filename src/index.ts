@@ -45,6 +45,12 @@
  */
 
 import type { Subprocess } from "bun";
+import {
+  ABS_ATTRS,
+  tracerOrNoop,
+  type TracerProvider as TelemetryTracerProvider,
+  type Span as TelemetrySpan
+} from "@absolutejs/telemetry";
 
 export type TenantSource =
   | { kind: "directory"; root: string };
@@ -225,6 +231,21 @@ export type RuntimeOptions = {
    * Tests use this to point at a fixture script.
    */
   command?: readonly string[];
+  /**
+   * Optional OpenTelemetry tracer provider. When set, each
+   * `ensure()` / `restart()` is wrapped in a `runtime.spawn` span
+   * with `abs.tenant`, `abs.runtime.pid`, `abs.runtime.port`,
+   * `abs.runtime.readiness_ms`, and (on exit) `abs.runtime.exit_reason`
+   * attributes. The span is the ROOT of the customer's trace —
+   * everything inside the spawned tenant inherits the active context
+   * if it propagates correctly (W3C trace context via env / headers).
+   * When omitted, all tracing is a zero-allocation noop. Added in 0.3.0.
+   *
+   * Pass any `@opentelemetry/api`-compatible `TracerProvider`. See
+   * `@absolutejs/telemetry` for the type shape — runtime re-uses its
+   * helpers but doesn't peer-dep `@opentelemetry/api` directly.
+   */
+  tracerProvider?: TelemetryTracerProvider;
 };
 
 export type RuntimeStats = {
@@ -477,6 +498,11 @@ export const createRuntime = (options: RuntimeOptions): Runtime => {
   let lastObserveAt = 0;
   let disposed = false;
   let draining = false;
+  // 0.3.0: OTel tracer + per-pid open spans. spawnFresh opens a
+  // `runtime.spawn` span; the exit handler reads it back to close
+  // with abs.runtime.exit_reason. Noop when tracerProvider unset.
+  const tracer = tracerOrNoop(options.tracerProvider, "@absolutejs/runtime");
+  const openSpawnSpans = new Map<number, TelemetrySpan>();
   // 0.2.0: cumulative operator counters surfaced via metrics(). Survive
   // dispose() so post-shutdown introspection still reads totals.
   let totalSpawns = 0;
@@ -666,6 +692,22 @@ export const createRuntime = (options: RuntimeOptions): Runtime => {
 
     totalSpawns += 1;
     lastSpawnMs = Date.now() - spawnStart;
+
+    // 0.3.0: open the per-tenant span. Lifetime = from spawn-success
+    // through process exit (closed by the exit handler below). The
+    // span is the ROOT of the customer's trace for this tenant
+    // session — sync mutations / queue jobs / etc. nest under it if
+    // OTel context propagates correctly across the process boundary.
+    const spawnSpan = tracer.startSpan("runtime.spawn", {
+      attributes: {
+        [ABS_ATTRS.runtimeKey]: key,
+        [ABS_ATTRS.runtimePid]: child.pid,
+        [ABS_ATTRS.runtimePort]: port,
+        [ABS_ATTRS.runtimeReadinessMs]: lastSpawnMs,
+      },
+    });
+    openSpawnSpans.set(child.pid, spawnSpan);
+
     emitTransition({ key, pid: child.pid, port, type: "spawn" });
 
     // Reap the entry when the process exits. We capture the entry's
@@ -678,6 +720,26 @@ export const createRuntime = (options: RuntimeOptions): Runtime => {
           stashed ?? (exitCode === 0 ? "exited-clean" : "crashed");
         exitReasons.delete(child.pid);
         totalExits[reason] += 1;
+        // 0.3.0: close the tenant's spawn span on exit. Status maps
+        // the reason: exited-clean / idle-killed / lru-evicted /
+        // disposed / restarted are OK (planned); crashed /
+        // readiness-timeout / killed are ERROR.
+        const exitSpan = openSpawnSpans.get(child.pid);
+        if (exitSpan !== undefined) {
+          openSpawnSpans.delete(child.pid);
+          exitSpan.setAttribute(ABS_ATTRS.runtimeExitReason, reason);
+          if (exitCode !== null && exitCode !== undefined) {
+            exitSpan.setAttribute("abs.runtime.exit_code", exitCode);
+          }
+          const ok =
+            reason === "exited-clean" ||
+            reason === "idle-killed" ||
+            reason === "lru-evicted" ||
+            reason === "disposed" ||
+            reason === "restarted";
+          exitSpan.setStatus({ code: ok ? 1 /* OK */ : 2 /* ERROR */ });
+          exitSpan.end();
+        }
         emitTransition({
           exitCode: exitCode ?? null,
           key,

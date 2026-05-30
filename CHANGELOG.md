@@ -2,6 +2,39 @@
 
 All notable changes to `@absolutejs/runtime` are documented here.
 
+## 0.3.0 — 2026-05-30
+
+### Added — OpenTelemetry tracing via @absolutejs/telemetry
+
+Closes G2 from the deep-research audit for the runtime — the root of
+the customer trace. Each tenant spawn becomes a long-running span
+that bookends the tenant process's lifetime (from `ensure()` /
+`restart()` through process exit), so customer SREs investigating a
+crash can follow the trace from the failing tenant's `runtime.spawn`
+span down into any sync mutations / queue jobs / secret resolves the
+tenant performed before going down.
+
+- **`RuntimeOptions.tracerProvider?: TracerProvider`** — any
+  `@opentelemetry/api`-compatible `TracerProvider`. Structural type
+  via `@absolutejs/telemetry` (no peer-dep on `@opentelemetry/api`).
+- **`runtime.spawn` span** opens on spawn success with
+  `abs.runtime.key` / `abs.runtime.pid` / `abs.runtime.port` /
+  `abs.runtime.readiness_ms` attributes. Closes on process exit with
+  `abs.runtime.exit_reason` (from the structured `ExitReason` union)
+  + `abs.runtime.exit_code` set.
+- **Status mapping**: `exited-clean` / `idle-killed` / `lru-evicted` /
+  `disposed` / `restarted` map to OK (planned exits). `crashed` /
+  `readiness-timeout` / `killed` map to ERROR.
+- `@absolutejs/telemetry` added as a regular dep (250 LOC, zero
+  transitive deps).
+- Zero-cost when `tracerProvider` absent — singleton noop tracer.
+
+4 new tests in `tests/tracing.test.ts`: span attributes on spawn,
+status + exit_reason on `kill()`, two-tenant distinctness, noop
+fallback.
+
+Test count: 29 → 33.
+
 ## 0.2.0 — 2026-05-29
 
 Substrate-pattern uniformity. Backwards-compatible — `stats()` keeps
