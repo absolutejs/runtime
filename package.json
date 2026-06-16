@@ -6,6 +6,10 @@
     "type": "git",
     "url": "git+https://github.com/absolutejs/runtime.git"
   },
+  "homepage": "https://github.com/absolutejs/runtime",
+  "bugs": {
+    "url": "https://github.com/absolutejs/runtime/issues"
+  },
   "main": "./dist/index.js",
   "module": "./dist/index.js",
   "types": "./dist/index.d.ts",
