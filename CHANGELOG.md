@@ -2,6 +2,75 @@
 
 All notable changes to `@absolutejs/runtime` are documented here.
 
+## 0.4.0 — 2026-07-13
+
+Closes two operational gaps from the PaaS guide (5.2 process-level
+hibernation, 5.7 outbound network policy) as backwards-compatible
+additive features.
+
+### Added — checkpoint/restore seam (EXPERIMENTAL)
+
+Bun has no `process.checkpoint()`, so idle resume pays a full cold
+spawn. This ships the SEAM so the control plane can pilot criu (or any
+snapshot mechanism) without forking the runtime.
+
+- **`CheckpointDriver`** interface — `checkpoint({ key, pid })` (true =
+  image written AND process gone; false/throw = decline, fall back to
+  normal idle-kill), `restore({ key })` (`{ pid } | null`),
+  `drop(key)`, `has(key)`.
+- **`createRuntime({ checkpoint: { driver, restoreTimeoutMs? } })`** —
+  ONLY the idle path checkpoints (never `kill()` / `dispose()` / LRU).
+  On success the exit records the new reason **`checkpointed`** (added
+  to the `ExitReason` union + `totalExits` counters; maps to OK span
+  status). `ensure()` tries `restore()` when `has(key)` — a restored
+  tenant is tracked as an EXTERNAL pid (no `Subprocess` handle:
+  liveness polled on the sweep interval, kills via `process.kill`,
+  `/proc` observation events unchanged) and emits a new
+  **`{ type: 'restored', key, pid, port, durationMs }`** transition.
+  Restore failure/timeout → `drop(key)` → normal spawn. The image is
+  also dropped after a successful restore (double-resume would fork
+  state) and on `restart()` (new code ⇒ stale image).
+- **`stats()`/`metrics()` gain a `checkpoints` block** —
+  `{ checkpoints, restores, restoreFailures, lastRestoreMs }`
+  cumulative counters (`CheckpointMetrics`).
+- **`execCheckpointDriver({ checkpointCommand, restoreCommand,
+imageDir })`** — reference driver that shells out (criu-shaped);
+  `{key}` / `{pid}` / `{dir}` placeholders substituted per-argument,
+  restored pid parsed from a `RESTORED_PID=<n>` stdout line.
+- Documented loudly as EXPERIMENTAL: criu needs root + kernel support;
+  the `@absolutejs/isolated-jsc` "small tier" remains the recommended
+  hibernation path today.
+
+### Added — `createEgressGuard` (outbound network policy)
+
+Host-side guarded-fetch factory — hand each tenant
+`guard.fetchFor(tenant)` instead of the raw `fetch` (pairs with sync's
+sandbox `unsafeHost` / host-side bridge fetches).
+
+- **Default allowlist** denies private/loopback/link-local/metadata
+  address space (10/8, 172.16/12, 192.168/16, 127/8, 169.254/16,
+  0.0.0.0, `::`, `::1`, `fc00::/7`, `fe80::/10`, IPv4-mapped IPv6) and
+  `localhost` / `*.localhost` / `*.internal`; allows public. Override
+  via `allow: (tenant, url) => boolean`. Hostname-based — DNS rebinding
+  caveat documented.
+- **Per-tenant rolling-window budgets** `{ requests?, bytes?,
+windowMs }` — count requests on start; bytes are
+  Content-Length-or-zero (no body teeing; documented). Budget exceeded
+  mid-window denies with `requests-budget` / `bytes-budget`.
+- **`EgressDeniedError`** (exported) with `.reason` / `.tenant` /
+  `.url`; `onDeny` observational hook; `fetchImpl` + `now` injection
+  for tests; `guard.metrics()` → `{ tenants, requests, denied,
+bytesEgress }`; `guard.reset(tenant?)`.
+- `tracerProvider` support consistent with the existing pattern —
+  `runtime.egress_fetch` span with `abs.tenant` +
+  `abs.egress.allowed` / `abs.egress.deny_reason`.
+
+7 new tests in `tests/checkpoint.test.ts` (fake in-memory driver whose
+"restore" spawns a real fixture process so external-pid liveness and
+/proc observation are exercised for real), 11 in `tests/egress.test.ts`.
+
+Test count: 33 → 51.
+
 ## 0.3.0 — 2026-05-30
 
 ### Added — OpenTelemetry tracing via @absolutejs/telemetry
@@ -21,7 +90,7 @@ tenant performed before going down.
   `abs.runtime.key` / `abs.runtime.pid` / `abs.runtime.port` /
   `abs.runtime.readiness_ms` attributes. Closes on process exit with
   `abs.runtime.exit_reason` (from the structured `ExitReason` union)
-  + `abs.runtime.exit_code` set.
+  - `abs.runtime.exit_code` set.
 - **Status mapping**: `exited-clean` / `idle-killed` / `lru-evicted` /
   `disposed` / `restarted` map to OK (planned exits). `crashed` /
   `readiness-timeout` / `killed` map to ERROR.
@@ -75,7 +144,7 @@ the new surface is purely additive plus richer event payloads.
   fast until `retryAt`. After `maxFailures` (default 10), the key stays
   refused until `clearBackoff(key)`. Default policy: `baseMs=1_000`,
   `maxMs=60_000`, `maxFailures=10`. Override via `backoff: { baseMs?,
-  maxMs?, maxFailures? }`.
+maxMs?, maxFailures? }`.
 - **`restart(key)`** — kill + spawn fresh in one call. Used by deploys
   that need to swap to a new release after the `current` symlink moves.
   Single-flight contract matches `ensure`.

@@ -60,7 +60,9 @@ afterEach(async () => {
 
 describe("createRuntime", () => {
   test("ensure spawns the tenant process, returns a usable port, reaches /health", async () => {
-    runtime = createRuntime({ source: { kind: "directory", root: fixturesRoot } });
+    runtime = createRuntime({
+      source: { kind: "directory", root: fixturesRoot },
+    });
 
     const tenant = await runtime.ensure("alpha");
     expect(tenant.key).toBe("alpha");
@@ -75,7 +77,9 @@ describe("createRuntime", () => {
   });
 
   test("ensure called twice for the same key reuses the same process", async () => {
-    runtime = createRuntime({ source: { kind: "directory", root: fixturesRoot } });
+    runtime = createRuntime({
+      source: { kind: "directory", root: fixturesRoot },
+    });
     const first = await runtime.ensure("alpha");
     const second = await runtime.ensure("alpha");
     expect(second.pid).toBe(first.pid);
@@ -84,7 +88,9 @@ describe("createRuntime", () => {
   });
 
   test("concurrent ensure for the same key shares a single-flight spawn", async () => {
-    runtime = createRuntime({ source: { kind: "directory", root: fixturesRoot } });
+    runtime = createRuntime({
+      source: { kind: "directory", root: fixturesRoot },
+    });
     const [a, b, c] = await Promise.all([
       runtime.ensure("alpha"),
       runtime.ensure("alpha"),
@@ -96,7 +102,9 @@ describe("createRuntime", () => {
   });
 
   test("different keys spawn distinct processes", async () => {
-    runtime = createRuntime({ source: { kind: "directory", root: fixturesRoot } });
+    runtime = createRuntime({
+      source: { kind: "directory", root: fixturesRoot },
+    });
     const alpha = await runtime.ensure("alpha");
     const beta = await runtime.ensure("beta");
     expect(alpha.pid).not.toBe(beta.pid);
@@ -105,7 +113,9 @@ describe("createRuntime", () => {
   });
 
   test("kill terminates the child and removes it from the map", async () => {
-    runtime = createRuntime({ source: { kind: "directory", root: fixturesRoot } });
+    runtime = createRuntime({
+      source: { kind: "directory", root: fixturesRoot },
+    });
     const alpha = await runtime.ensure("alpha");
     expect(runtime.stats().running).toBe(1);
     await runtime.kill("alpha");
@@ -183,7 +193,9 @@ describe("createRuntime", () => {
   });
 
   test("dispose kills every running child", async () => {
-    runtime = createRuntime({ source: { kind: "directory", root: fixturesRoot } });
+    runtime = createRuntime({
+      source: { kind: "directory", root: fixturesRoot },
+    });
     await runtime.ensure("alpha");
     await runtime.ensure("beta");
     expect(runtime.stats().running).toBe(2);
@@ -230,7 +242,9 @@ describe("createRuntime", () => {
   });
 
   test("dispose makes further ensure calls throw", async () => {
-    runtime = createRuntime({ source: { kind: "directory", root: fixturesRoot } });
+    runtime = createRuntime({
+      source: { kind: "directory", root: fixturesRoot },
+    });
     await runtime.ensure("alpha");
     await runtime.dispose();
     let caught: unknown;
@@ -306,7 +320,9 @@ describe("createRuntime", () => {
   });
 
   test("restart kills the old child and spawns a fresh one", async () => {
-    runtime = createRuntime({ source: { kind: "directory", root: fixturesRoot } });
+    runtime = createRuntime({
+      source: { kind: "directory", root: fixturesRoot },
+    });
     const first = await runtime.ensure("alpha");
     const before = first.pid;
     const after = await runtime.restart("alpha");
@@ -365,7 +381,9 @@ describe("createRuntime", () => {
     await expect(runtime.ensure("alpha")).rejects.toThrow();
     await new Promise((resolve) => setTimeout(resolve, 50));
     // 4th attempt: now over maxFailures, should refuse without invoking spawn.
-    await expect(runtime.ensure("alpha")).rejects.toThrow(/exceeded.*consecutive/i);
+    await expect(runtime.ensure("alpha")).rejects.toThrow(
+      /exceeded.*consecutive/i,
+    );
   });
 
   test("drain refuses new ensure calls; existing tenants keep running", async () => {
@@ -388,16 +406,31 @@ describe("createRuntime", () => {
 
   test("observation metrics fire periodically on Linux", async () => {
     if (process.platform !== "linux") return;
-    const metrics: { type: string; key?: string; cpuMs?: number; rssBytes?: number }[] = [];
+    const metrics: {
+      type: string;
+      key?: string;
+      cpuMs?: number;
+      rssBytes?: number;
+    }[] = [];
     runtime = createRuntime({
       observeIntervalMs: 50,
-      onMetrics: (event) => metrics.push(event as { type: string; key?: string; cpuMs?: number; rssBytes?: number }),
+      onMetrics: (event) =>
+        metrics.push(
+          event as {
+            type: string;
+            key?: string;
+            cpuMs?: number;
+            rssBytes?: number;
+          },
+        ),
       source: { kind: "directory", root: fixturesRoot },
       sweepIntervalMs: 30,
     });
     await runtime.ensure("alpha");
     await new Promise((resolve) => setTimeout(resolve, 200));
-    const observations = metrics.filter((event) => event.type === "observation");
+    const observations = metrics.filter(
+      (event) => event.type === "observation",
+    );
     expect(observations.length).toBeGreaterThan(0);
     const sample = observations[0];
     if (sample) {
