@@ -2,6 +2,27 @@
 
 All notable changes to `@absolutejs/runtime` are documented here.
 
+## 0.5.0 — 2026-07-14
+
+### Added
+
+- **`RuntimeProcess`** is the minimal scheduler-owned process contract:
+  host-visible `pid`, `exited`, and sync-or-async `kill()`. Bun's native
+  `Subprocess` remains the default implementation, while container and remote
+  adapters can now participate without pretending to be a Bun child process.
+- **`resourceId`** optionally carries a driver identity such as a Docker
+  container id through `Tenant`, metrics, and lifecycle transitions.
+- **`runtime.adopt()`** registers a process that survived a control-plane
+  restart so it remains subject to the same kill, restart, drain, idle/LRU,
+  observation, and exit reconciliation behavior.
+- **`shouldIdleKill`** can consult proxy or container activity immediately
+  before eviction when tenant traffic does not pass through `runtime.touch()`.
+
+### Fixed
+
+- Runtime termination now awaits asynchronous driver `kill()` operations
+  before awaiting exit, preserving ordered teardown for container engines.
+
 ## 0.4.1 — 2026-07-14
 
 ### Fixed

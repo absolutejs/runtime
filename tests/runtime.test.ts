@@ -17,6 +17,7 @@ import {
   createRuntime,
   type Runtime,
   type RuntimeLogEvent,
+  type RuntimeProcess,
   type RuntimeTransitionEvent,
 } from "../src";
 
@@ -59,6 +60,101 @@ afterEach(async () => {
 });
 
 describe("createRuntime", () => {
+  test("accepts an async external process handle and preserves its resource id", async () => {
+    let resolveExit: (code: number | null) => void = () => {};
+    const exited = new Promise<number | null>((resolve) => {
+      resolveExit = resolve;
+    });
+    let killed = false;
+    const transitions: RuntimeTransitionEvent[] = [];
+    const processHandle: RuntimeProcess = {
+      exited,
+      kill: async () => {
+        killed = true;
+        resolveExit(0);
+      },
+      pid: 4242,
+      resourceId: "container-42",
+    };
+    runtime = createRuntime({
+      readiness: async () => true,
+      onTransition: (event) => transitions.push(event),
+      source: { kind: "directory", root: fixturesRoot },
+      spawn: async () => processHandle,
+    });
+
+    const tenant = await runtime.ensure("alpha");
+    expect(tenant.pid).toBe(4242);
+    expect(tenant.resourceId).toBe("container-42");
+    await runtime.kill("alpha");
+    expect(killed).toBe(true);
+    expect(runtime.stats().running).toBe(0);
+    expect(transitions.find((event) => event.type === "exit")).toMatchObject({
+      resourceId: "container-42",
+      type: "exit",
+    });
+  });
+
+  test("adopts an existing external process into lifecycle management", async () => {
+    let resolveExit: (code: number | null) => void = () => {};
+    const exited = new Promise<number | null>((resolve) => {
+      resolveExit = resolve;
+    });
+    const transitions: RuntimeTransitionEvent[] = [];
+    runtime = createRuntime({
+      onTransition: (event) => transitions.push(event),
+      source: { kind: "directory", root: fixturesRoot },
+    });
+
+    const tenant = await runtime.adopt(
+      "alpha",
+      {
+        exited,
+        kill: () => resolveExit(0),
+        pid: 4343,
+        resourceId: "container-43",
+      },
+      { port: 3625, startedAt: 100 },
+    );
+
+    expect(tenant).toMatchObject({
+      key: "alpha",
+      pid: 4343,
+      port: 3625,
+      resourceId: "container-43",
+      startedAt: 100,
+    });
+    expect(await runtime.ensure("alpha")).toBe(tenant);
+    expect(transitions[0]).toMatchObject({
+      resourceId: "container-43",
+      type: "adopt",
+    });
+    await runtime.kill("alpha");
+    expect(runtime.stats().running).toBe(0);
+  });
+
+  test("consults external activity before idle-kill", async () => {
+    let eligible = false;
+    let checks = 0;
+    runtime = createRuntime({
+      idleAfterMs: 50,
+      shouldIdleKill: async () => {
+        checks += 1;
+        return eligible;
+      },
+      source: { kind: "directory", root: fixturesRoot },
+      sweepIntervalMs: 20,
+    });
+
+    await runtime.ensure("alpha");
+    await new Promise((resolve) => setTimeout(resolve, 120));
+    expect(checks).toBeGreaterThan(0);
+    expect(runtime.stats().running).toBe(1);
+    eligible = true;
+    await new Promise((resolve) => setTimeout(resolve, 80));
+    expect(runtime.stats().running).toBe(0);
+  });
+
   test("ensure spawns the tenant process, returns a usable port, reaches /health", async () => {
     runtime = createRuntime({
       source: { kind: "directory", root: fixturesRoot },

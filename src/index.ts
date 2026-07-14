@@ -44,7 +44,6 @@
  * ```
  */
 
-import type { Subprocess } from "bun";
 import { mkdir, readdir, rm } from "node:fs/promises";
 import {
   ABS_ATTRS,
@@ -63,6 +62,8 @@ export type Tenant = {
   port: number;
   /** OS process id. */
   pid: number;
+  /** Optional driver-specific identity, such as a Docker container id. */
+  resourceId?: string;
   /** Wall-clock when the child was spawned. */
   startedAt: number;
   /** Last time the consumer marked this tenant active. */
@@ -75,6 +76,7 @@ export type RuntimeMetricEvent =
       key: string;
       pid: number;
       port: number;
+      resourceId?: string;
       durationMs: number;
     }
   | {
@@ -203,12 +205,13 @@ export type CheckpointMetrics = {
 };
 
 export type RuntimeTransitionEvent =
-  | { type: "spawn"; key: string; pid: number; port: number }
+  | { type: "spawn"; key: string; pid: number; port: number; resourceId?: string }
   | {
       type: "ready";
       key: string;
       pid: number;
       port: number;
+      resourceId?: string;
       durationMs: number;
     }
   | {
@@ -223,8 +226,16 @@ export type RuntimeTransitionEvent =
       type: "exit";
       key: string;
       pid: number;
+      resourceId?: string;
       exitCode: number | null;
       reason: ExitReason;
+    }
+  | {
+      type: "adopt";
+      key: string;
+      pid: number;
+      port: number;
+      resourceId?: string;
     }
   | {
       /** A spawn was deferred because the key is in the back-off window after a failure. */
@@ -256,12 +267,42 @@ export type ReadinessCheck = (args: {
   startedAt: number;
 }) => Promise<boolean>;
 
+/**
+ * Minimal process handle required by the runtime scheduler. Bun Subprocess
+ * satisfies this contract, as do container and remote-process adapters.
+ */
+export type RuntimeProcess = {
+  /** Resolves once the managed process exits. */
+  exited: Promise<number | null>;
+  /** Host-visible pid used for metrics and liveness observation. */
+  pid: number;
+  /** Optional driver-specific identity, such as a container id. */
+  resourceId?: string;
+  /** Request a graceful stop. May be synchronous or asynchronous. */
+  kill: () => void | Promise<void>;
+};
+
 export type SpawnFn = (args: {
   cwd: string;
   env: Record<string, string>;
   onLogLine: (event: RuntimeLogEvent) => void;
   key: string;
-}) => Promise<Subprocess>;
+}) => Promise<RuntimeProcess>;
+
+export type ShouldIdleKill = (args: {
+  idleMs: number;
+  key: string;
+  tenant: Readonly<Tenant>;
+}) => boolean | Promise<boolean>;
+
+export type AdoptOptions = {
+  /** Last known activity time. Defaults to now. */
+  lastTouchedAt?: number;
+  /** Port already bound by the process. Defaults to 0 for externally routed processes. */
+  port?: number;
+  /** Original process start time. Defaults to now. */
+  startedAt?: number;
+};
 
 export type SpawnBackoff = {
   /** First retry waits this long. Default 1000 ms. */
@@ -282,6 +323,12 @@ export type RuntimeOptions = {
    * explicit `kill()` shed processes then).
    */
   idleAfterMs?: number;
+  /**
+   * Optional final eligibility check before an idle tenant is terminated.
+   * Useful when activity is observed by an external proxy or container
+   * health endpoint rather than through `touch()`. Defaults to `true`.
+   */
+  shouldIdleKill?: ShouldIdleKill;
   /**
    * Max concurrent tenant processes. When a fresh `ensure()` would
    * push past this, the least-recently-touched process is killed
@@ -403,6 +450,16 @@ export type Runtime = {
    */
   ensure: (key: string) => Promise<Tenant>;
   /**
+   * Register an already-running process after a control-plane restart.
+   * The adopted process participates in idle/LRU eviction, transitions,
+   * metrics observation, kill, restart, drain, and dispose.
+   */
+  adopt: (
+    key: string,
+    process: RuntimeProcess,
+    options?: AdoptOptions,
+  ) => Promise<Tenant>;
+  /**
    * Mark `key` as active right now. Bumps the idle clock; the next
    * sweep won't consider it for idle-kill until `idleAfterMs` again.
    * Cheap; safe to call before/after each request you route to this
@@ -445,7 +502,7 @@ type Entry = {
   /** Set while the spawn is in-flight; concurrent ensure() callers await it. */
   pending: Promise<Tenant> | null;
   tenant: Tenant | null;
-  child: Subprocess | null;
+  child: RuntimeProcess | null;
   /**
    * 0.4.0: pid of a checkpoint-restored tenant. Mutually exclusive with
    * `child` — there's no Subprocess handle, so liveness is polled on
@@ -614,6 +671,7 @@ export const createRuntime = (options: RuntimeOptions): Runtime => {
   const sweepIntervalMs = options.sweepIntervalMs ?? 10_000;
   const observeIntervalMs = options.observeIntervalMs ?? 30_000;
   const readiness = options.readiness ?? defaultReadiness;
+  const shouldIdleKill = options.shouldIdleKill ?? (() => true);
   const command = options.command ?? ["bun", "run", "start"];
   const spawn = options.spawn ?? defaultSpawn(command);
   const onMetrics = options.onMetrics;
@@ -691,6 +749,47 @@ export const createRuntime = (options: RuntimeOptions): Runtime => {
     }
   };
 
+  const watchChild = (key: string, child: RuntimeProcess): void => {
+    void child.exited
+      .then((exitCode) => {
+        const stashed = exitReasons.get(child.pid);
+        const reason: ExitReason =
+          stashed ?? (exitCode === 0 ? "exited-clean" : "crashed");
+        exitReasons.delete(child.pid);
+        totalExits[reason] += 1;
+        const exitSpan = openSpawnSpans.get(child.pid);
+        if (exitSpan !== undefined) {
+          openSpawnSpans.delete(child.pid);
+          exitSpan.setAttribute(ABS_ATTRS.runtimeExitReason, reason);
+          if (exitCode !== null && exitCode !== undefined) {
+            exitSpan.setAttribute("abs.runtime.exit_code", exitCode);
+          }
+          const ok =
+            reason === "exited-clean" ||
+            reason === "idle-killed" ||
+            reason === "lru-evicted" ||
+            reason === "disposed" ||
+            reason === "restarted" ||
+            reason === "checkpointed";
+          exitSpan.setStatus({ code: ok ? 1 /* OK */ : 2 /* ERROR */ });
+          exitSpan.end();
+        }
+        emitTransition({
+          exitCode: exitCode ?? null,
+          key,
+          pid: child.pid,
+          reason,
+          resourceId: child.resourceId,
+          type: "exit",
+        });
+        const current = entries.get(key);
+        if (current !== undefined && current.child === child) {
+          entries.delete(key);
+        }
+      })
+      .catch(() => {});
+  };
+
   const tenantCwd = (key: string): string => {
     if (source.kind === "directory") {
       return `${source.root}/${key}`;
@@ -709,7 +808,7 @@ export const createRuntime = (options: RuntimeOptions): Runtime => {
       entry.pendingExitReason = reason;
       exitReasons.set(child.pid, reason);
       try {
-        child.kill();
+        await child.kill();
       } catch {
         /* already dead */
       }
@@ -879,18 +978,33 @@ export const createRuntime = (options: RuntimeOptions): Runtime => {
         if (idleAfterMs <= 0) continue;
         const idleMs = now - entry.tenant.lastTouchedAt;
         if (idleMs >= idleAfterMs) {
-          if (checkpointDriver !== undefined) {
-            void checkpointOrIdleKill(key, entry, idleMs).catch(() => {});
-            continue;
-          }
-          emitTransition({
-            idleMs,
-            key,
-            pid: entry.tenant.pid,
-            reason: "idle-threshold",
-            type: "idle-kill",
-          });
-          void removeEntry(key, entry, "idle-killed").catch(() => {});
+          const tenant = entry.tenant;
+          void Promise.resolve()
+            .then(() => shouldIdleKill({ idleMs, key, tenant }))
+            .then(async (eligible) => {
+              const current = entries.get(key);
+              if (
+                !eligible ||
+                current !== entry ||
+                current.tenant !== tenant ||
+                Date.now() - tenant.lastTouchedAt < idleAfterMs
+              ) {
+                return;
+              }
+              if (checkpointDriver !== undefined) {
+                await checkpointOrIdleKill(key, entry, idleMs);
+                return;
+              }
+              emitTransition({
+                idleMs,
+                key,
+                pid: tenant.pid,
+                reason: "idle-threshold",
+                type: "idle-kill",
+              });
+              await removeEntry(key, entry, "idle-killed");
+            })
+            .catch(() => {});
         }
       }
       void observeRunning().catch(() => {});
@@ -948,7 +1062,7 @@ export const createRuntime = (options: RuntimeOptions): Runtime => {
       PORT: String(port),
     };
 
-    let child: Subprocess;
+    let child: RuntimeProcess;
     const spawnStart = Date.now();
     try {
       child = await spawn({
@@ -964,7 +1078,7 @@ export const createRuntime = (options: RuntimeOptions): Runtime => {
     }
 
     totalSpawns += 1;
-    lastSpawnMs = Date.now() - spawnStart;
+    lastSpawnMs = Math.max(1, Date.now() - spawnStart);
 
     // 0.3.0: open the per-tenant span. Lifetime = from spawn-success
     // through process exit (closed by the exit handler below). The
@@ -981,52 +1095,17 @@ export const createRuntime = (options: RuntimeOptions): Runtime => {
     });
     openSpawnSpans.set(child.pid, spawnSpan);
 
-    emitTransition({ key, pid: child.pid, port, type: "spawn" });
+    emitTransition({
+      key,
+      pid: child.pid,
+      port,
+      resourceId: child.resourceId,
+      type: "spawn",
+    });
 
-    // Reap the entry when the process exits. We capture the entry's
-    // `pendingExitReason` if some code path set one; otherwise classify
-    // by exit code.
-    void child.exited
-      .then((exitCode) => {
-        const stashed = exitReasons.get(child.pid);
-        const reason: ExitReason =
-          stashed ?? (exitCode === 0 ? "exited-clean" : "crashed");
-        exitReasons.delete(child.pid);
-        totalExits[reason] += 1;
-        // 0.3.0: close the tenant's spawn span on exit. Status maps
-        // the reason: exited-clean / idle-killed / lru-evicted /
-        // disposed / restarted are OK (planned); crashed /
-        // readiness-timeout / killed are ERROR.
-        const exitSpan = openSpawnSpans.get(child.pid);
-        if (exitSpan !== undefined) {
-          openSpawnSpans.delete(child.pid);
-          exitSpan.setAttribute(ABS_ATTRS.runtimeExitReason, reason);
-          if (exitCode !== null && exitCode !== undefined) {
-            exitSpan.setAttribute("abs.runtime.exit_code", exitCode);
-          }
-          const ok =
-            reason === "exited-clean" ||
-            reason === "idle-killed" ||
-            reason === "lru-evicted" ||
-            reason === "disposed" ||
-            reason === "restarted" ||
-            reason === "checkpointed";
-          exitSpan.setStatus({ code: ok ? 1 /* OK */ : 2 /* ERROR */ });
-          exitSpan.end();
-        }
-        emitTransition({
-          exitCode: exitCode ?? null,
-          key,
-          pid: child.pid,
-          reason,
-          type: "exit",
-        });
-        const current = entries.get(key);
-        if (current !== undefined && current.child === child) {
-          entries.delete(key);
-        }
-      })
-      .catch(() => {});
+    // Reap the entry when the process exits. The watcher also supports
+    // externally managed processes registered through adopt().
+    watchChild(key, child);
 
     try {
       await readiness({ key, port, startedAt });
@@ -1036,7 +1115,7 @@ export const createRuntime = (options: RuntimeOptions): Runtime => {
         entry.pendingExitReason = "readiness-timeout";
       }
       try {
-        child.kill();
+        await child.kill();
       } catch {
         /* ignore */
       }
@@ -1050,6 +1129,7 @@ export const createRuntime = (options: RuntimeOptions): Runtime => {
       lastTouchedAt: Date.now(),
       pid: child.pid,
       port,
+      resourceId: child.resourceId,
       startedAt,
     };
     const entry = entries.get(key);
@@ -1065,6 +1145,7 @@ export const createRuntime = (options: RuntimeOptions): Runtime => {
       key,
       pid: child.pid,
       port,
+      resourceId: child.resourceId,
       type: "spawn",
     });
     emitTransition({
@@ -1072,6 +1153,7 @@ export const createRuntime = (options: RuntimeOptions): Runtime => {
       key,
       pid: child.pid,
       port,
+      resourceId: child.resourceId,
       type: "ready",
     });
     startSweepIfNeeded();
@@ -1182,6 +1264,42 @@ export const createRuntime = (options: RuntimeOptions): Runtime => {
   };
 
   return {
+    async adopt(key, processHandle, adoptOptions = {}) {
+      if (disposed) throw new Error("runtime has been disposed");
+      if (draining) throw new Error("runtime is draining; adopt() refused");
+      if (entries.has(key)) {
+        throw new Error(`Tenant "${key}" is already registered`);
+      }
+      evictLruIfNeeded();
+      const now = Date.now();
+      const tenant: Tenant = {
+        key,
+        lastTouchedAt: adoptOptions.lastTouchedAt ?? now,
+        pid: processHandle.pid,
+        port: adoptOptions.port ?? 0,
+        resourceId: processHandle.resourceId,
+        startedAt: adoptOptions.startedAt ?? now,
+      };
+      entries.set(key, {
+        child: processHandle,
+        externalPid: null,
+        key,
+        pending: null,
+        pendingExitReason: null,
+        tenant,
+      });
+      watchChild(key, processHandle);
+      emitTransition({
+        key,
+        pid: processHandle.pid,
+        port: tenant.port,
+        resourceId: processHandle.resourceId,
+        type: "adopt",
+      });
+      startSweepIfNeeded();
+      return tenant;
+    },
+
     async ensure(key) {
       if (disposed) throw new Error("runtime has been disposed");
       const existing = entries.get(key);

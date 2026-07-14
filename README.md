@@ -67,6 +67,17 @@ The `exit` transition's `reason` field is one of: `crashed`, `exited-clean`, `id
 
 `spawn` and `readiness` are overrides on `createRuntime`. The default `spawn` runs `['bun', 'run', 'start']` with `PORT` injected; the default `readiness` polls `http://127.0.0.1:${port}/` every 100ms with a 30s deadline. Tests use the spawn override to bypass disk; production use is mostly the defaults.
 
+`spawn` returns the minimal `RuntimeProcess` contract (`pid`, `exited`, and a
+sync-or-async `kill`). Bun's `Subprocess` satisfies it directly. Container
+adapters can return the host pid plus `resourceId` (for example, a Docker
+container id) while retaining the same idle-kill, LRU, restart, drain, metrics,
+and backoff behavior.
+
+Use `runtime.adopt(key, process)` during boot reconciliation when a managed
+process survived a control-plane restart. For externally routed traffic,
+`shouldIdleKill` can perform a final activity check before eviction instead of
+requiring every request to pass through `runtime.touch()`.
+
 ### Checkpoint/restore seam (0.4.0) — ⚠️ EXPERIMENTAL
 
 Bun has no `process.checkpoint()`, so the first request after an idle-kill pays a full cold spawn. The `checkpoint` option is a **seam**: the control plane can pilot [criu](https://criu.org) (or any snapshot mechanism) without forking the runtime.
