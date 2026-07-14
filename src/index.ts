@@ -1449,10 +1449,9 @@ export type EgressBudgets = {
   /** Max requests STARTED per tenant per rolling window. */
   requests?: number;
   /**
-   * Max response bytes per tenant per rolling window. Bytes are counted
-   * from the response `Content-Length` header when present, else `0` —
-   * a streamed/chunked response without the header is NOT metered (we
-   * deliberately don't tee the body; see README).
+   * Max response bytes per tenant per rolling window. Declared
+   * `Content-Length` is counted immediately; otherwise streamed/chunked
+   * response bytes are counted as the caller consumes the body.
    */
   bytes?: number;
   /** Rolling window length. Timestamps are pruned on each check. */
@@ -1608,6 +1607,34 @@ const isPrivateHostname = (rawHostname: string): boolean => {
 const defaultEgressAllow = (_tenant: string, url: URL): boolean =>
   !isPrivateHostname(url.hostname);
 
+const meterStreamingResponse = (
+  response: Response,
+  recordBytes: (bytes: number) => void,
+): Response => {
+  if (response.body === null) return response;
+  const body = response.body.pipeThrough(
+    new TransformStream<Uint8Array, Uint8Array>({
+      transform(chunk, controller) {
+        recordBytes(chunk.byteLength);
+        controller.enqueue(chunk);
+      },
+    }),
+  );
+  const metered = new Response(body, {
+    headers: response.headers,
+    status: response.status,
+    statusText: response.statusText,
+  });
+  // A reconstructed Response otherwise loses fetch metadata that callers may
+  // inspect even though its status, headers, and body are preserved.
+  Object.defineProperties(metered, {
+    redirected: { configurable: true, value: response.redirected },
+    type: { configurable: true, value: response.type },
+    url: { configurable: true, value: response.url },
+  });
+  return metered;
+};
+
 type TenantEgressState = {
   /** Start timestamps of requests in the current window. */
   requestStamps: number[];
@@ -1747,13 +1774,19 @@ export const createEgressGuard = (
             Number.isFinite(contentLength) && contentLength > 0
               ? contentLength
               : 0;
+          const recordBytes = (observedBytes: number): void => {
+            if (observedBytes <= 0) return;
+            state.byteStamps.push({ at, bytes: observedBytes });
+            totalBytes += observedBytes;
+          };
           if (bytes > 0) {
-            state.byteStamps.push({ at, bytes });
-            totalBytes += bytes;
+            recordBytes(bytes);
           }
           span.setAttribute("abs.egress.allowed", true);
           span.setStatus({ code: 1 /* OK */ });
-          return response;
+          return bytes > 0
+            ? response
+            : meterStreamingResponse(response, recordBytes);
         } catch (error) {
           if (error instanceof EgressDeniedError) {
             span.setAttribute("abs.egress.allowed", false);

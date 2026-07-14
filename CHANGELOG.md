@@ -2,6 +2,18 @@
 
 All notable changes to `@absolutejs/runtime` are documented here.
 
+## 0.4.1 — 2026-07-14
+
+### Fixed
+
+- Meter streamed/chunked response bytes in `createEgressGuard` when upstream
+  omits `Content-Length`. The returned body uses a zero-buffer transform, so
+  SSE and other streaming consumers retain backpressure while their consumed
+  bytes enter the tenant's rolling budget and cumulative metrics.
+- Align the runtime dependency on `@absolutejs/telemetry` with `^0.1.1` and
+  remove its redundant development declaration, preventing a second,
+  structurally incompatible telemetry generation in current hosts.
+
 ## 0.4.0 — 2026-07-13
 
 Closes two operational gaps from the PaaS guide (5.2 process-level

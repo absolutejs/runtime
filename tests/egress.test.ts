@@ -245,26 +245,41 @@ describe("createEgressGuard — 0.4.0", () => {
     expect(m.bytesEgress).toBe(750);
   });
 
-  test("Request and URL inputs are accepted; responses without Content-Length count zero bytes", async () => {
+  test("Request and URL inputs are accepted; streamed responses meter consumed bytes", async () => {
     const calls: string[] = [];
     const guard = createEgressGuard({
+      budgets: { bytes: 10, windowMs: 60_000 },
       fetchImpl: async (input) => {
         calls.push(input instanceof Request ? input.url : String(input));
-        return new Response("streamed"); // no content-length header set...
+        return new Response(
+          new ReadableStream<Uint8Array>({
+            start(controller) {
+              controller.enqueue(new TextEncoder().encode("streamed"));
+              controller.close();
+            },
+          }),
+          { status: 201, statusText: "Created" },
+        );
       },
     });
     const guarded = guard.fetchFor("tenant-1");
-    await guarded(new URL("https://example.com/from-url"));
-    await guarded(new Request("https://example.com/from-request"));
+    const fromUrl = await guarded(new URL("https://example.com/from-url"));
+    expect(fromUrl.status).toBe(201);
+    expect(fromUrl.statusText).toBe("Created");
+    expect(await fromUrl.text()).toBe("streamed");
+    const fromRequest = await guarded(
+      new Request("https://example.com/from-request"),
+    );
+    expect(await fromRequest.text()).toBe("streamed");
     await expect(
       guarded(new Request("http://192.168.0.10/private")),
     ).rejects.toThrow(EgressDeniedError);
     expect(calls).toHaveLength(2);
-    // Documented Content-Length-or-zero accounting: Response("streamed")
-    // may synthesize a Content-Length in Bun; assert the metric merely
-    // never goes negative and requests counted.
     const m = guard.metrics();
     expect(m.requests).toBe(2);
-    expect(m.bytesEgress).toBeGreaterThanOrEqual(0);
+    expect(m.bytesEgress).toBe(16);
+    await expect(guarded("https://example.com/over-budget")).rejects.toThrow(
+      /bytes-budget/,
+    );
   });
 });

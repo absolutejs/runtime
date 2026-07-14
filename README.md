@@ -155,7 +155,11 @@ Details:
 
 - **Default allowlist** denies private/loopback/link-local/metadata address space — `10/8`, `172.16/12`, `192.168/16`, `127/8`, `169.254/16`, `0.0.0.0`, `::`, `::1`, `fc00::/7`, `fe80::/10`, IPv4-mapped IPv6 equivalents — plus the bare hostnames `localhost`, `*.localhost`, `*.internal`. Everything else is allowed. Override with `allow: (tenant, url) => boolean` (it replaces the default entirely). **Caveat**: the default check is hostname-based and does not resolve DNS — a public name pointing at a private address (DNS rebinding) passes; use a resolving `allow` hook if that's in your threat model.
 - **Budgets** are per-tenant rolling windows (timestamps pruned on each check). Requests count on start; a request that would push past `requests`, or that starts while window bytes already ≥ `bytes`, throws `EgressDeniedError` with `reason: 'requests-budget'` / `'bytes-budget'`.
-- **Byte accounting is `Content-Length`-or-zero.** Responses without the header (chunked/streamed) count as 0 bytes — we deliberately don't tee the body stream, so the bytes budget is a backstop against large declared payloads, not an exact meter.
+- **Byte accounting covers declared and streamed responses.** A valid
+  `Content-Length` is counted immediately. Without it, the returned body is
+  wrapped in a zero-buffer transform and chunks are counted as the caller
+  consumes them. The bytes budget applies to the next request once the rolling
+  total reaches its cap; it does not truncate a response already in flight.
 - `tracerProvider` (same pattern as `createRuntime`) wraps each call in a `runtime.egress_fetch` span with `abs.tenant`, `abs.egress.host`, `abs.egress.allowed`, and `abs.egress.deny_reason` attributes.
 
 ## Architectural role
