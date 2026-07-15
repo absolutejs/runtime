@@ -1,6 +1,6 @@
 {
   "name": "@absolutejs/runtime",
-  "version": "0.5.0",
+  "version": "0.6.0",
   "description": "Multi-tenant Bun runtime substrate for PaaS providers — spawn isolated child Bun processes per tenant, idle-kill, metric emit. The library SB-6 surfaces between isolated-jsc + sync and the hosted product downstream.",
   "repository": {
     "type": "git",

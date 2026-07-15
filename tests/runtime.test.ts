@@ -95,6 +95,34 @@ describe("createRuntime", () => {
     });
   });
 
+  test("uses the actual port reported by an external process adapter", async () => {
+    let requestedPort = 0;
+    const { promise: exited, resolve: resolveExit } = Promise.withResolvers<
+      number | null
+    >();
+    const processHandle: RuntimeProcess = {
+      exited,
+      kill: () => resolveExit(0),
+      pid: 4244,
+      port: 45_678,
+      resourceId: "container-44",
+    };
+    runtime = createRuntime({
+      readiness: async ({ port }) => port === processHandle.port,
+      source: { kind: "directory", root: fixturesRoot },
+      spawn: async ({ env }) => {
+        requestedPort = Number(env.PORT);
+
+        return processHandle;
+      },
+    });
+
+    const tenant = await runtime.ensure("alpha");
+
+    expect(requestedPort).not.toBe(45_678);
+    expect(tenant.port).toBe(45_678);
+  });
+
   test("adopts an existing external process into lifecycle management", async () => {
     let resolveExit: (code: number | null) => void = () => {};
     const exited = new Promise<number | null>((resolve) => {

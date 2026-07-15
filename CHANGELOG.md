@@ -2,6 +2,20 @@
 
 All notable changes to `@absolutejs/runtime` are documented here.
 
+## 0.6.0 — 2026-07-15
+
+### Added
+
+- External `RuntimeProcess` adapters may return their actual bound `port`.
+  The runtime uses that port for readiness, lifecycle events, metrics, and the
+  returned tenant. This lets container runtimes preserve a fixed host firewall
+  range instead of accepting the scheduler's ephemeral port.
+
+### Fixed
+
+- Invalid adapter ports fail the spawn with normal backoff and best-effort
+  process cleanup instead of registering an unreachable tenant.
+
 ## 0.5.0 — 2026-07-14
 
 ### Added

@@ -70,8 +70,9 @@ The `exit` transition's `reason` field is one of: `crashed`, `exited-clean`, `id
 `spawn` returns the minimal `RuntimeProcess` contract (`pid`, `exited`, and a
 sync-or-async `kill`). Bun's `Subprocess` satisfies it directly. Container
 adapters can return the host pid plus `resourceId` (for example, a Docker
-container id) while retaining the same idle-kill, LRU, restart, drain, metrics,
-and backoff behavior.
+container id) and `port` when the adapter must bind inside a fixed firewall
+range. The reported port becomes the readiness and tenant port while retaining
+the same idle-kill, LRU, restart, drain, metrics, and backoff behavior.
 
 Use `runtime.adopt(key, process)` during boot reconciliation when a managed
 process survived a control-plane restart. For externally routed traffic,

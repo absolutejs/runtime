@@ -205,7 +205,13 @@ export type CheckpointMetrics = {
 };
 
 export type RuntimeTransitionEvent =
-  | { type: "spawn"; key: string; pid: number; port: number; resourceId?: string }
+  | {
+      type: "spawn";
+      key: string;
+      pid: number;
+      port: number;
+      resourceId?: string;
+    }
   | {
       type: "ready";
       key: string;
@@ -278,6 +284,8 @@ export type RuntimeProcess = {
   pid: number;
   /** Optional driver-specific identity, such as a container id. */
   resourceId?: string;
+  /** Actual bound port when an external adapter cannot use the requested `PORT`. */
+  port?: number;
   /** Request a graceful stop. May be synchronous or asynchronous. */
   kill: () => void | Promise<void>;
 };
@@ -1053,13 +1061,13 @@ export const createRuntime = (options: RuntimeOptions): Runtime => {
     if (draining) throw new Error("runtime is draining; ensure() refused");
     evictLruIfNeeded();
 
-    const port = allocateEphemeralPort();
+    const requestedPort = allocateEphemeralPort();
     const startedAt = Date.now();
     const cwd = tenantCwd(key);
     const env: Record<string, string> = {
       ...(process.env as Record<string, string>),
       NODE_ENV: "production",
-      PORT: String(port),
+      PORT: String(requestedPort),
     };
 
     let child: RuntimeProcess;
@@ -1073,6 +1081,19 @@ export const createRuntime = (options: RuntimeOptions): Runtime => {
       });
     } catch (error) {
       entries.delete(key);
+      recordBackoff(key, error);
+      throw error;
+    }
+
+    const port = child.port ?? requestedPort;
+    if (!Number.isInteger(port) || port <= 0 || port > 65_535) {
+      try {
+        await child.kill();
+      } catch {
+        /* best-effort cleanup for an invalid adapter response */
+      }
+      entries.delete(key);
+      const error = new Error("Runtime process returned an invalid port");
       recordBackoff(key, error);
       throw error;
     }
