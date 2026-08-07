@@ -2,6 +2,10 @@
 
 All notable changes to `@absolutejs/runtime` are documented here.
 
+## 0.6.2 — 2026-08-07
+
+- Accepts the shared `@absolutejs/telemetry` 0.3 runtime line.
+
 ## 0.6.0 — 2026-07-15
 
 ### Added
