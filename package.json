@@ -33,13 +33,14 @@
     "test": "bun test tests/",
     "typecheck": "tsc --noEmit",
     "format": "prettier --write \"./**/*.{ts,json,md}\"",
-    "check:package": "bun run typecheck && bun run build && bun run test",
+    "check:package": "bun run typecheck && bun run build && bun run test && absolute-changelog check",
     "release": "bun run format && bun run check:package && bun publish"
   },
   "dependencies": {
     "@absolutejs/telemetry": "^0.2.0"
   },
   "devDependencies": {
+    "@absolutejs/changelog": "^0.1.2",
     "@types/bun": "1.3.14",
     "prettier": "3.5.3",
     "typescript": "5.9.3"
@@ -55,7 +56,9 @@
     }
   },
   "files": [
-    "dist",
-    "README.md"
+    "CHANGELOG.md",
+    "README.md",
+    "changelog.json",
+    "dist"
   ]
 }
