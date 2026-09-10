@@ -8,7 +8,7 @@
         "@absolutejs/telemetry": "^0.2.0",
       },
       "devDependencies": {
-        "@absolutejs/changelog": "^0.4.0",
+        "@absolutejs/changelog": "^0.5.1",
         "@types/bun": "1.3.14",
         "prettier": "3.5.3",
         "typescript": "5.9.3",
@@ -16,7 +16,7 @@
     },
   },
   "packages": {
-    "@absolutejs/changelog": ["@absolutejs/changelog@0.4.0", "", { "dependencies": { "typescript": "^5.8.3" }, "bin": { "absolute-changelog": "dist/cli.js" } }, "sha512-4+rna0EUk1kZMGHJRmXIWvP+MV6pS4Ay24m+3h0XybYD/4ycgOXwdez7CUdb6hZQr7GC7XXTyhDzheEDAdlFcQ=="],
+    "@absolutejs/changelog": ["@absolutejs/changelog@0.5.1", "", { "dependencies": { "typescript": "^5.8.3" }, "bin": { "absolute-changelog": "dist/cli.js" } }, "sha512-6KxBk+couOvAlNrvwQOBJZt3MDS/RRyKeazRYt8tIemPXjn22oGwHKkPLploa4zS2dT0y6KCikxnOQAecbttRQ=="],
 
     "@absolutejs/telemetry": ["@absolutejs/telemetry@0.2.0", "", {}, "sha512-4Xh9lShoa1QrSvzRRjIR/5h5pqed60Wc6SLliCkoGjZd8XOtQM3tP4aKTA3LgQ22tUDmxpcZitRzuDU9dMX9Fw=="],
 
