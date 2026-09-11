@@ -6,6 +6,16 @@
 			"changes": [
 				{
 					"kind": "fixed",
+					"summary": "depends on @absolutejs/telemetry ^0.3.0, restoring what 0.6.2 shipped"
+				}
+			],
+			"date": "2026-09-11",
+			"version": "0.7.1"
+		},
+		{
+			"changes": [
+				{
+					"kind": "fixed",
 					"summary": "readiness races the process, so a spawn that exits early fails with its exit code instead of waiting out the readiness window"
 				},
 				{
