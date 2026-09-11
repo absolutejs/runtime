@@ -1,5 +1,20 @@
 {
 	"contract": 1,
 	"name": "@absolutejs/runtime",
-	"releases": []
+	"releases": [
+		{
+			"changes": [
+				{
+					"kind": "fixed",
+					"summary": "readiness races the process, so a spawn that exits early fails with its exit code instead of waiting out the readiness window"
+				},
+				{
+					"kind": "added",
+					"summary": "RuntimeExitedBeforeReadyError names a process that died before it ever became ready"
+				}
+			],
+			"date": "2026-09-11",
+			"version": "0.7.0"
+		}
+	]
 }

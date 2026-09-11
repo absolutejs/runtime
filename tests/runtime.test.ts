@@ -15,6 +15,7 @@ import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import {
   createRuntime,
+  RuntimeExitedBeforeReadyError,
   type Runtime,
   type RuntimeLogEvent,
   type RuntimeProcess,
@@ -378,6 +379,45 @@ describe("createRuntime", () => {
       caught = error;
     }
     expect((caught as Error).message).toMatch(/disposed/);
+    runtime = null;
+  });
+
+  test("a process that exits before it is ready fails with its exit code, not with the readiness window", async () => {
+    /* The failure this prevents is a customer being told their container was
+     * too slow when it was dead within a second. Readiness here never
+     * resolves: if the spawn waited for it, this test would sit for the
+     * length of the window and then report the wrong cause. */
+    const { promise: exited, resolve: resolveExit } = Promise.withResolvers<
+      number | null
+    >();
+    let killed = false;
+    runtime = createRuntime({
+      readiness: () => new Promise<boolean>(() => {}),
+      source: { kind: "directory", root: fixturesRoot },
+      spawn: async () => {
+        setTimeout(() => resolveExit(1), 10);
+
+        return {
+          exited,
+          kill: () => {
+            killed = true;
+            resolveExit(1);
+          },
+          pid: 4246,
+          resourceId: "container-46",
+        } satisfies RuntimeProcess;
+      },
+    });
+
+    const caught = await runtime
+      .ensure("alpha")
+      .catch((error: unknown) => error);
+
+    expect(caught).toBeInstanceOf(RuntimeExitedBeforeReadyError);
+    expect((caught as RuntimeExitedBeforeReadyError).exitCode).toBe(1);
+    expect((caught as Error).message).toContain("alpha");
+    expect(killed).toBe(true);
+    expect(runtime.stats().running).toBe(0);
     runtime = null;
   });
 

@@ -1128,11 +1128,31 @@ export const createRuntime = (options: RuntimeOptions): Runtime => {
     // externally managed processes registered through adopt().
     watchChild(key, child);
 
+    /* Readiness races the process itself. A process that has already exited
+     * will never answer a probe, so waiting out the rest of the window buys
+     * nothing and then reports the wrong cause -- "readiness timed out" for
+     * something that crashed in its first second, which sends whoever reads
+     * it looking for a timeout to raise. */
+    const ready = readiness({ key, port, startedAt });
+    ready.catch(() => undefined);
+    const exitedFirst = child.exited.then(
+      (exitCode) => new RuntimeExitedBeforeReadyError(key, exitCode),
+      () => new RuntimeExitedBeforeReadyError(key, null),
+    );
     try {
-      await readiness({ key, port, startedAt });
+      const exitedBeforeReady = await Promise.race([
+        ready.then(() => null),
+        exitedFirst,
+      ]);
+      if (exitedBeforeReady !== null) {
+        throw exitedBeforeReady;
+      }
     } catch (error) {
       const entry = entries.get(key);
-      if (entry !== undefined) {
+      if (
+        entry !== undefined &&
+        !(error instanceof RuntimeExitedBeforeReadyError)
+      ) {
         entry.pendingExitReason = "readiness-timeout";
       }
       try {
@@ -1657,6 +1677,30 @@ export type EgressGuard = {
   /** Re-open budgets: clear window state for `tenant`, or every tenant when omitted. Cumulative counters are kept. */
   reset: (tenant?: string) => void;
 };
+
+/**
+ * Thrown when a freshly spawned process exits before it ever became ready.
+ *
+ * The distinction this draws is the whole point of it: a readiness check that
+ * runs out of time says the process was too slow, and a caller who is handed
+ * that sentence about a process that died in the first second goes looking for
+ * a timeout to raise. `exitCode` is what the process actually left with.
+ */
+export class RuntimeExitedBeforeReadyError extends Error {
+  readonly exitCode: number | null;
+  readonly key: string;
+
+  constructor(key: string, exitCode: number | null) {
+    super(
+      `Runtime process for "${key}" exited with ${
+        exitCode === null ? "no exit code" : `code ${exitCode}`
+      } before it was ready`,
+    );
+    this.name = "RuntimeExitedBeforeReadyError";
+    this.exitCode = exitCode;
+    this.key = key;
+  }
+}
 
 /**
  * Thrown by a guarded fetch on deny. `reason` is the machine-readable
