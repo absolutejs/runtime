@@ -6,6 +6,16 @@
 			"changes": [
 				{
 					"kind": "fixed",
+					"summary": "Refused process shutdowns reject promptly, retain the process for retry, and prevent replacement before confirmed exit"
+				}
+			],
+			"date": "2026-09-25",
+			"version": "0.7.2"
+		},
+		{
+			"changes": [
+				{
+					"kind": "fixed",
 					"summary": "depends on @absolutejs/telemetry ^0.3.0, restoring what 0.6.2 shipped"
 				}
 			],

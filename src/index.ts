@@ -694,6 +694,8 @@ export const createRuntime = (options: RuntimeOptions): Runtime => {
   const restoreTimeoutMs = options.checkpoint?.restoreTimeoutMs ?? 10_000;
 
   const entries = new Map<string, Entry>();
+  const stopping = new Map<Entry, Promise<void>>();
+  let disposing: Promise<void> | undefined;
   const backoffs = new Map<string, BackoffState>();
   /** Pending exit reasons keyed by child pid — read by the .then exit handler. */
   const exitReasons = new Map<number, ExitReason>();
@@ -817,13 +819,11 @@ export const createRuntime = (options: RuntimeOptions): Runtime => {
       exitReasons.set(child.pid, reason);
       try {
         await child.kill();
-      } catch {
-        /* already dead */
-      }
-      try {
         await child.exited;
-      } catch {
-        /* ignore */
+      } catch (error) {
+        entry.pendingExitReason = null;
+        exitReasons.delete(child.pid);
+        throw error;
       }
       return;
     }
@@ -854,8 +854,18 @@ export const createRuntime = (options: RuntimeOptions): Runtime => {
     entry: Entry,
     reason: ExitReason,
   ): Promise<void> => {
-    entries.delete(key);
-    await killChildWithReason(entry, reason);
+    const pending = stopping.get(entry);
+    if (pending) return pending;
+    const operation = (async () => {
+      await killChildWithReason(entry, reason);
+      if (entries.get(key) === entry) entries.delete(key);
+    })();
+    stopping.set(entry, operation);
+    try {
+      await operation;
+    } finally {
+      if (stopping.get(entry) === operation) stopping.delete(entry);
+    }
   };
 
   const recordBackoff = (key: string, error: unknown): void => {
@@ -1343,7 +1353,12 @@ export const createRuntime = (options: RuntimeOptions): Runtime => {
 
     async ensure(key) {
       if (disposed) throw new Error("runtime has been disposed");
-      const existing = entries.get(key);
+      let existing = entries.get(key);
+      while (existing && stopping.has(existing)) {
+        await stopping.get(existing);
+        if (disposed) throw new Error("runtime has been disposed");
+        existing = entries.get(key);
+      }
       if (existing !== undefined) {
         if (existing.tenant !== null) {
           existing.tenant.lastTouchedAt = Date.now();
@@ -1458,17 +1473,32 @@ export const createRuntime = (options: RuntimeOptions): Runtime => {
     },
 
     async dispose() {
-      if (disposed) return;
+      if (disposing) return disposing;
       disposed = true;
       if (sweepTimer !== undefined) {
         clearInterval(sweepTimer);
         sweepTimer = undefined;
       }
       const snapshot = [...entries.entries()];
-      entries.clear();
-      await Promise.all(
-        snapshot.map(([_key, entry]) => killChildWithReason(entry, "disposed")),
-      );
+      const operation = Promise.allSettled(
+        snapshot.map(([key, entry]) => removeEntry(key, entry, "disposed")),
+      ).then((results) => {
+        const failures = results.filter(
+          (result): result is PromiseRejectedResult =>
+            result.status === "rejected",
+        );
+        if (failures.length)
+          throw new AggregateError(
+            failures.map((result) => result.reason),
+            "Runtime shutdown did not complete; failed processes remain tracked for retry",
+          );
+      });
+      disposing = operation;
+      try {
+        await operation;
+      } finally {
+        if (disposing === operation) disposing = undefined;
+      }
     },
   };
 };
