@@ -6,6 +6,20 @@
 			"changes": [
 				{
 					"kind": "fixed",
+					"summary": "Observations measure the tenant's whole process tree: CPU is each live process's own time plus that of children it has reaped, and memory is the summed resident set. Measuring the root pid alone reported an init shim's (docker --init) near-zero CPU and memory while the app went unmetered. The tree reader is exported as readProcessTreeStats.",
+					"symbols": [
+						"readProcessTreeStats",
+						"RuntimeMetricEvent"
+					]
+				}
+			],
+			"date": "2026-09-30",
+			"version": "0.7.3"
+		},
+		{
+			"changes": [
+				{
+					"kind": "fixed",
 					"summary": "Refused process shutdowns reject promptly, retain the process for retry, and prevent replacement before confirmed exit"
 				}
 			],

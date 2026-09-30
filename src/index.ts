@@ -84,9 +84,9 @@ export type RuntimeMetricEvent =
       type: "observation";
       key: string;
       pid: number;
-      /** Cumulative CPU ms used by the child since spawn, derived from `/proc/<pid>/stat`. */
+      /** Cumulative CPU ms of the child's whole process tree since spawn (see `readProcessTreeStats`). */
       cpuMs: number;
-      /** Resident set size in bytes, derived from `/proc/<pid>/status` VmRSS. */
+      /** Summed resident set size of the child's process tree, in bytes. */
       rssBytes: number;
       at: number;
     };
@@ -584,40 +584,129 @@ const isPidAlive = (pid: number): boolean => {
   }
 };
 
+type ProcEntry = { cpuTicks: number; ppid: number; rssBytes: number };
+
 /**
- * Read CPU + RSS for a pid from `/proc`. Returns `null` if the pid is gone
- * or we're not on Linux. The math: `utime + stime` from `/proc/<pid>/stat`
- * is in clock ticks; we divide by `Bun.clockTicksPerSecond` (or fall back
- * to 100 — the universal default for Linux kernels).
+ * One process's own CPU (utime + stime), the CPU of children it has already
+ * reaped (cutime + cstime), its parent, and its resident memory. `comm` can
+ * contain spaces, so fields are counted from the closing paren.
  */
-const readProcStats = async (
-  pid: number,
-): Promise<{ cpuMs: number; rssBytes: number } | null> => {
-  if (!isLinux) return null;
+const readProcEntry = async (pid: number): Promise<ProcEntry | null> => {
   try {
     const statText = await Bun.file(`/proc/${pid}/stat`).text();
-    const statusText = await Bun.file(`/proc/${pid}/status`).text();
-    // /proc/<pid>/stat: ... (comm) ... and utime/stime are fields 14 and 15
-    // counting from 1; but `comm` can contain spaces, so we anchor on the
-    // closing paren.
     const closeParen = statText.lastIndexOf(")");
     if (closeParen === -1) return null;
     const after = statText.slice(closeParen + 2).split(" ");
-    // After (comm), the fields are: state ppid pgrp session ... utime stime ...
-    // utime = field 14 of the whole line = index (14 - 3 - 1) = 10 of `after`.
-    const utime = Number(after[11]);
-    const stime = Number(after[12]);
-    if (!Number.isFinite(utime) || !Number.isFinite(stime)) return null;
-    const ticksPerSec =
-      (globalThis as { Bun?: { clockTicksPerSecond?: number } }).Bun
-        ?.clockTicksPerSecond ?? 100;
-    const cpuMs = ((utime + stime) / ticksPerSec) * 1000;
+    const ppid = Number(after[1]);
+    const ticks = [after[11], after[12], after[13], after[14]].map(Number);
+    if (!Number.isFinite(ppid) || ticks.some((tick) => !Number.isFinite(tick)))
+      return null;
+    const statusText = await Bun.file(`/proc/${pid}/status`)
+      .text()
+      .catch(() => "");
     const match = statusText.match(/^VmRSS:\s+(\d+)\s+kB/m);
-    const rssBytes = match && match[1] ? Number(match[1]) * 1024 : 0;
-    return { cpuMs, rssBytes };
+
+    return {
+      cpuTicks: ticks.reduce((total, tick) => total + tick, 0),
+      ppid,
+      rssBytes: match?.[1] ? Number(match[1]) * 1024 : 0,
+    };
   } catch {
     return null;
   }
+};
+
+/** The kernel's own child lists, one per thread; null when unavailable. */
+const childrenFromTasks = async (pid: number) => {
+  try {
+    const tasks = await readdir(`/proc/${pid}/task`);
+    const lists = await Promise.all(
+      tasks.map((task) =>
+        Bun.file(`/proc/${pid}/task/${task}/children`).text(),
+      ),
+    );
+
+    return lists
+      .join(" ")
+      .split(/\s+/)
+      .filter(Boolean)
+      .map(Number)
+      .filter(Number.isInteger);
+  } catch {
+    return null;
+  }
+};
+
+/** Every process's parent, for kernels without the child lists. */
+const parentsByScan = async () => {
+  const children = new Map<number, number[]>();
+  const pids = (await readdir("/proc")).filter((name) => /^\d+$/.test(name));
+  const entries = await Promise.all(
+    pids.map(
+      async (name) =>
+        [Number(name), await readProcEntry(Number(name))] as const,
+    ),
+  );
+  for (const [pid, entry] of entries) {
+    if (!entry) continue;
+    const siblings = children.get(entry.ppid) ?? [];
+    siblings.push(pid);
+    children.set(entry.ppid, siblings);
+  }
+
+  return children;
+};
+
+/**
+ * CPU and resident memory for a whole process tree rooted at `pid`, or null
+ * when the root is gone or this is not Linux.
+ *
+ * A container's pid is usually an init shim (`docker run --init`), and a
+ * runtime process often forks workers; measuring the root alone reported
+ * the shim's near-zero CPU and memory while the app itself went unmetered.
+ * Each live process contributes its own CPU plus that of the children it
+ * has reaped, so short-lived children are counted once and never twice.
+ * Memory is the sum of resident sets (shared pages count once per process).
+ */
+export const readProcessTreeStats = async (
+  pid: number,
+): Promise<{ cpuMs: number; processes: number; rssBytes: number } | null> => {
+  if (!isLinux) return null;
+  const root = await readProcEntry(pid);
+  if (!root) return null;
+  let scanned: Map<number, number[]> | null = null;
+  const childrenOf = async (parent: number) => {
+    const listed = await childrenFromTasks(parent);
+    if (listed) return listed;
+    scanned ??= await parentsByScan();
+
+    return scanned.get(parent) ?? [];
+  };
+  const ticksPerSec =
+    (globalThis as { Bun?: { clockTicksPerSecond?: number } }).Bun
+      ?.clockTicksPerSecond ?? 100;
+  const seen = new Set<number>([pid]);
+  const queue = [pid];
+  let cpuTicks = 0;
+  let rssBytes = 0;
+  while (queue.length > 0) {
+    const current = queue.shift()!;
+    const entry = current === pid ? root : await readProcEntry(current);
+    if (!entry) continue;
+    cpuTicks += entry.cpuTicks;
+    rssBytes += entry.rssBytes;
+    for (const child of await childrenOf(current)) {
+      if (seen.has(child)) continue;
+      seen.add(child);
+      queue.push(child);
+    }
+  }
+
+  return {
+    cpuMs: (cpuTicks / ticksPerSec) * 1000,
+    processes: seen.size,
+    rssBytes,
+  };
 };
 
 const defaultSpawn =
@@ -902,7 +991,7 @@ export const createRuntime = (options: RuntimeOptions): Runtime => {
     lastObserveAt = now;
     for (const [key, entry] of entries) {
       if (entry.tenant === null) continue;
-      const stats = await readProcStats(entry.tenant.pid);
+      const stats = await readProcessTreeStats(entry.tenant.pid);
       if (stats === null) continue;
       emitMetric({
         at: now,
